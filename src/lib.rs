@@ -18,9 +18,12 @@ mod util;
 mod wal;
 mod write_batch;
 
-pub use crate::db::{DB, DbIterator, Range, Snapshot};
+pub use crate::db::{
+    DB, DbEvent, DbEventKind, DbIterator, DbMetrics, DbStallReason, Range, Snapshot,
+};
 pub use crate::error::{GraniteError, Result};
 pub use crate::options::{Options, SyncMode};
+pub use crate::sstable::{BlockCache, TableReader};
 pub use crate::write_batch::{WriteBatch, WriteOp};
 
 #[cfg(feature = "fuzzing")]

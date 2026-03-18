@@ -1,8 +1,10 @@
+use std::collections::VecDeque;
 use std::fs;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{GraniteError, Result};
 use crate::failpoint;
@@ -49,6 +51,42 @@ impl Iterator for DbIterator {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct DbMetrics {
+    pub puts: u64,
+    pub deletes: u64,
+    pub write_batches: u64,
+    pub stall_waits: u64,
+    pub flushes: u64,
+    pub compactions: u64,
+    pub background_errors: u64,
+    pub checkpoints: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct DbEvent {
+    pub at_micros: u64,
+    pub kind: DbEventKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DbStallReason {
+    ImmutableMemtable,
+    CompactionNeeded,
+    L0Stop,
+}
+
+#[derive(Clone, Debug)]
+pub enum DbEventKind {
+    Stall { reason: DbStallReason },
+    FlushStart { file_id: u64 },
+    FlushFinish { file_id: u64 },
+    CompactionStart,
+    CompactionFinish,
+    CheckpointFinish { manifest_number: u64 },
+    BackgroundError,
+}
+
 struct WriterState {
     manifest: Manifest,
     version: VersionSet,
@@ -65,6 +103,8 @@ struct WriterState {
     shutting_down: bool,
     bg_error: Option<GraniteError>,
     block_cache: Arc<BlockCache>,
+    metrics: DbMetrics,
+    events: VecDeque<DbEvent>,
     options: Options,
 }
 
@@ -77,6 +117,29 @@ pub struct DB {
 struct Shared {
     state: Mutex<WriterState>,
     cv: Condvar,
+}
+
+fn now_micros() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0)
+}
+
+impl WriterState {
+    fn record_event(&mut self, kind: DbEventKind) {
+        let cap = self.options.event_log_capacity;
+        if cap == 0 {
+            return;
+        }
+        while self.events.len() >= cap {
+            self.events.pop_front();
+        }
+        self.events.push_back(DbEvent {
+            at_micros: now_micros(),
+            kind,
+        });
+    }
 }
 
 impl DB {
@@ -136,6 +199,8 @@ impl DB {
                 shutting_down: false,
                 bg_error: None,
                 block_cache,
+                metrics: DbMetrics::default(),
+                events: VecDeque::new(),
                 options,
             }),
             cv: Condvar::new(),
@@ -189,6 +254,24 @@ impl DB {
         w.wal.sync()
     }
 
+    pub fn metrics(&self) -> Result<DbMetrics> {
+        let w = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| GraniteError::Corrupt("poisoned"))?;
+        Ok(w.metrics.clone())
+    }
+
+    pub fn recent_events(&self) -> Result<Vec<DbEvent>> {
+        let w = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| GraniteError::Corrupt("poisoned"))?;
+        Ok(w.events.iter().cloned().collect())
+    }
+
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         let batch = WriteBatch::default().put(key.to_vec(), value.to_vec());
         self.write_batch(batch)
@@ -227,12 +310,34 @@ impl DB {
                 break;
             }
 
+            w.metrics.stall_waits = w.metrics.stall_waits.saturating_add(1);
+            let reason = if w.imm_memtable.is_some() || w.imm_flushing {
+                DbStallReason::ImmutableMemtable
+            } else if w.version.levels[0].len() > w.options.l0_stop_trigger {
+                DbStallReason::L0Stop
+            } else {
+                DbStallReason::CompactionNeeded
+            };
+            w.record_event(DbEventKind::Stall { reason });
+
             self.shared.cv.notify_all();
             w = self
                 .shared
                 .cv
                 .wait(w)
                 .map_err(|_| GraniteError::Corrupt("poisoned"))?;
+        }
+
+        w.metrics.write_batches = w.metrics.write_batches.saturating_add(1);
+        for op in &batch.ops {
+            match op {
+                WriteOp::Put { .. } => {
+                    w.metrics.puts = w.metrics.puts.saturating_add(1);
+                }
+                WriteOp::Delete { .. } => {
+                    w.metrics.deletes = w.metrics.deletes.saturating_add(1);
+                }
+            }
         }
 
         let start_seq = w.next_seq;
@@ -284,6 +389,12 @@ impl DB {
             w.imm_memtable = Some(Arc::new(std::mem::take(&mut w.memtable)));
             w.memtable = MemTable::default();
             w.imm_trigger_op_index = op_index;
+            let version_snapshot = w.version.clone();
+            let target = w.options.manifest_checkpoint_target_bytes;
+            if let Some(manifest_number) = w.manifest.maybe_checkpoint(&version_snapshot, target)? {
+                w.metrics.checkpoints = w.metrics.checkpoints.saturating_add(1);
+                w.record_event(DbEventKind::CheckpointFinish { manifest_number });
+            }
             self.shared.cv.notify_all();
         }
 
@@ -484,6 +595,7 @@ fn bg_worker(db_dir: PathBuf, shared: Arc<Shared>) {
                 let file_id = w.next_file_id;
                 w.next_file_id = w.next_file_id.saturating_add(1);
                 w.imm_flushing = true;
+                w.record_event(DbEventKind::FlushStart { file_id });
                 Some((
                     imm.clone(),
                     w.prev_wal_id,
@@ -562,6 +674,8 @@ fn bg_worker(db_dir: PathBuf, shared: Arc<Shared>) {
                         Ok(())
                     })() {
                         w.bg_error = Some(e);
+                        w.metrics.background_errors = w.metrics.background_errors.saturating_add(1);
+                        w.record_event(DbEventKind::BackgroundError);
                         w.imm_flushing = false;
                         shared.cv.notify_all();
                         return;
@@ -572,6 +686,25 @@ fn bg_worker(db_dir: PathBuf, shared: Arc<Shared>) {
                     w.version.last_sequence = w.version.last_sequence.max(last_sequence);
                     w.imm_memtable = None;
                     w.imm_flushing = false;
+                    w.metrics.flushes = w.metrics.flushes.saturating_add(1);
+                    w.record_event(DbEventKind::FlushFinish { file_id });
+                    let version_snapshot = w.version.clone();
+                    let target = w.options.manifest_checkpoint_target_bytes;
+                    match w.manifest.maybe_checkpoint(&version_snapshot, target) {
+                        Ok(Some(manifest_number)) => {
+                            w.metrics.checkpoints = w.metrics.checkpoints.saturating_add(1);
+                            w.record_event(DbEventKind::CheckpointFinish { manifest_number });
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            w.bg_error = Some(e);
+                            w.metrics.background_errors =
+                                w.metrics.background_errors.saturating_add(1);
+                            w.record_event(DbEventKind::BackgroundError);
+                            shared.cv.notify_all();
+                            return;
+                        }
+                    }
                     let _ = fs::remove_file(db_dir.join(wal_file_name(prev_wal_id)));
                     shared.cv.notify_all();
                 }
@@ -581,6 +714,8 @@ fn bg_worker(db_dir: PathBuf, shared: Arc<Shared>) {
                         Err(_) => std::process::abort(),
                     };
                     w.bg_error = Some(e);
+                    w.metrics.background_errors = w.metrics.background_errors.saturating_add(1);
+                    w.record_event(DbEventKind::BackgroundError);
                     w.imm_flushing = false;
                     shared.cv.notify_all();
                     return;
@@ -593,10 +728,31 @@ fn bg_worker(db_dir: PathBuf, shared: Arc<Shared>) {
             };
             let op_index = w.imm_trigger_op_index;
             let _op_guard = failpoint::set_current_op_index(op_index);
+            w.record_event(DbEventKind::CompactionStart);
             if let Err(e) = maybe_compact_levels(&db_dir, &mut w) {
                 w.bg_error = Some(e);
+                w.metrics.background_errors = w.metrics.background_errors.saturating_add(1);
+                w.record_event(DbEventKind::BackgroundError);
                 shared.cv.notify_all();
                 return;
+            }
+            w.metrics.compactions = w.metrics.compactions.saturating_add(1);
+            w.record_event(DbEventKind::CompactionFinish);
+            let version_snapshot = w.version.clone();
+            let target = w.options.manifest_checkpoint_target_bytes;
+            match w.manifest.maybe_checkpoint(&version_snapshot, target) {
+                Ok(Some(manifest_number)) => {
+                    w.metrics.checkpoints = w.metrics.checkpoints.saturating_add(1);
+                    w.record_event(DbEventKind::CheckpointFinish { manifest_number });
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    w.bg_error = Some(e);
+                    w.metrics.background_errors = w.metrics.background_errors.saturating_add(1);
+                    w.record_event(DbEventKind::BackgroundError);
+                    shared.cv.notify_all();
+                    return;
+                }
             }
             shared.cv.notify_all();
         } else if shutting_down {

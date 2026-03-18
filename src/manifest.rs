@@ -1,6 +1,6 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::error::{GraniteError, Result};
 use crate::failpoint;
@@ -76,6 +76,9 @@ pub struct Manifest {
     file: File,
     offset_in_block: usize,
     sync_mode: SyncMode,
+    db_dir: PathBuf,
+    manifest_name: String,
+    manifest_number: u64,
 }
 
 impl Manifest {
@@ -100,6 +103,7 @@ impl Manifest {
             write_current(db_dir, &name, sync_mode)?;
             name
         };
+        let manifest_number = parse_manifest_number(&manifest_name)?;
 
         let path = db_dir.join(&manifest_name);
         let mut file = OpenOptions::new()
@@ -118,6 +122,9 @@ impl Manifest {
                 file,
                 offset_in_block,
                 sync_mode,
+                db_dir: db_dir.to_path_buf(),
+                manifest_name,
+                manifest_number,
             },
             version,
         ))
@@ -175,6 +182,22 @@ impl Manifest {
         self.sync()
     }
 
+    pub fn maybe_checkpoint(
+        &mut self,
+        version: &VersionSet,
+        target_bytes: u64,
+    ) -> Result<Option<u64>> {
+        if target_bytes == 0 {
+            return Ok(None);
+        }
+        let len = self.file.metadata()?.len();
+        if len < target_bytes {
+            return Ok(None);
+        }
+        let new_number = self.checkpoint(version)?;
+        Ok(Some(new_number))
+    }
+
     pub fn sync(&mut self) -> Result<()> {
         if self.sync_mode == SyncMode::Yes {
             failpoint::hit("manifest:before_sync");
@@ -184,58 +207,121 @@ impl Manifest {
         Ok(())
     }
 
-    fn append_logical_record(&mut self, logical_payload: &[u8]) -> Result<()> {
-        self.file.seek(SeekFrom::End(0))?;
-        let mut remaining = logical_payload;
-        let mut is_first = true;
+    fn checkpoint(&mut self, version: &VersionSet) -> Result<u64> {
+        let old_name = self.manifest_name.clone();
+        let old_path = self.db_dir.join(&old_name);
+        let new_number = self.manifest_number.saturating_add(1);
+        let new_name = format!("MANIFEST-{new_number:06}");
+        let new_path = self.db_dir.join(&new_name);
 
-        while !remaining.is_empty() {
-            let block_remaining = BLOCK_SIZE - self.offset_in_block;
-            if block_remaining < HEADER_SIZE {
-                if block_remaining > 0 {
-                    let padding = vec![0u8; block_remaining];
-                    failpoint::write_all("manifest:write_padding", &mut self.file, &padding)?;
-                }
-                self.offset_in_block = 0;
-                continue;
-            }
+        let mut new_file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&new_path)?;
 
-            let available = block_remaining - HEADER_SIZE;
-            let chunk_len = available.min(remaining.len());
-            let chunk = &remaining[..chunk_len];
-            let is_last = chunk_len == remaining.len();
+        let payload = encode_snapshot(version);
+        let mut offset_in_block = 0usize;
+        append_logical_record_to(&mut new_file, &mut offset_in_block, &payload)?;
 
-            let record_type = match (is_first, is_last) {
-                (true, true) => RecordType::Full,
-                (true, false) => RecordType::First,
-                (false, false) => RecordType::Middle,
-                (false, true) => RecordType::Last,
-            };
-
-            if chunk_len > u16::MAX as usize {
-                return Err(GraniteError::InvalidArgument("manifest fragment too large"));
-            }
-
-            let mut crc_input = Vec::with_capacity(1 + chunk.len());
-            crc_input.push(record_type as u8);
-            crc_input.extend_from_slice(chunk);
-            let crc = crc32c::crc32c(&crc_input);
-
-            let mut header = [0u8; HEADER_SIZE];
-            header[..4].copy_from_slice(&crc.to_le_bytes());
-            header[4..6].copy_from_slice(&(chunk_len as u16).to_le_bytes());
-            header[6] = record_type as u8;
-
-            failpoint::write_all("manifest:write_header", &mut self.file, &header)?;
-            failpoint::write_all("manifest:write_payload", &mut self.file, chunk)?;
-
-            self.offset_in_block += HEADER_SIZE + chunk_len;
-            remaining = &remaining[chunk_len..];
-            is_first = false;
+        if self.sync_mode == SyncMode::Yes {
+            failpoint::sync_data("manifest:checkpoint_sync", &new_file)?;
+            sync_parent_dir(&new_path)?;
         }
 
-        Ok(())
+        write_current(&self.db_dir, &new_name, self.sync_mode)?;
+
+        self.file = new_file;
+        self.offset_in_block = offset_in_block;
+        self.manifest_name = new_name;
+        self.manifest_number = new_number;
+
+        let _ = std::fs::remove_file(old_path);
+        if self.sync_mode == SyncMode::Yes {
+            sync_parent_dir(&self.db_dir.join(&self.manifest_name))?;
+        }
+
+        Ok(new_number)
     }
+
+    fn append_logical_record(&mut self, logical_payload: &[u8]) -> Result<()> {
+        append_logical_record_to(&mut self.file, &mut self.offset_in_block, logical_payload)
+    }
+}
+
+fn parse_manifest_number(name: &str) -> Result<u64> {
+    let Some(rest) = name.strip_prefix("MANIFEST-") else {
+        return Err(GraniteError::Corrupt("bad manifest name"));
+    };
+    rest.parse::<u64>()
+        .map_err(|_| GraniteError::Corrupt("bad manifest number"))
+}
+
+fn encode_snapshot(version: &VersionSet) -> Vec<u8> {
+    let mut payload = Vec::new();
+    for level in &version.levels {
+        for meta in level {
+            encode_add_file(&mut payload, meta);
+        }
+    }
+    encode_set_log_number(&mut payload, version.log_number);
+    encode_set_prev_log_number(&mut payload, version.prev_log_number);
+    encode_set_last_sequence(&mut payload, version.last_sequence);
+    payload
+}
+
+fn append_logical_record_to(
+    file: &mut File,
+    offset_in_block: &mut usize,
+    logical_payload: &[u8],
+) -> Result<()> {
+    file.seek(SeekFrom::End(0))?;
+    let mut remaining = logical_payload;
+    let mut is_first = true;
+
+    while !remaining.is_empty() {
+        let block_remaining = BLOCK_SIZE - *offset_in_block;
+        if block_remaining < HEADER_SIZE {
+            if block_remaining > 0 {
+                let padding = vec![0u8; block_remaining];
+                failpoint::write_all("manifest:write_padding", file, &padding)?;
+            }
+            *offset_in_block = 0;
+            continue;
+        }
+
+        let available = block_remaining - HEADER_SIZE;
+        let chunk_len = available.min(remaining.len());
+        let chunk = &remaining[..chunk_len];
+        let is_last = chunk_len == remaining.len();
+
+        let record_type = match (is_first, is_last) {
+            (true, true) => RecordType::Full,
+            (true, false) => RecordType::First,
+            (false, false) => RecordType::Middle,
+            (false, true) => RecordType::Last,
+        };
+
+        let mut crc_input = Vec::with_capacity(1 + chunk.len());
+        crc_input.push(record_type as u8);
+        crc_input.extend_from_slice(chunk);
+        let crc = crc32c::crc32c(&crc_input);
+
+        let mut header = [0u8; HEADER_SIZE];
+        header[..4].copy_from_slice(&crc.to_le_bytes());
+        header[4..6].copy_from_slice(&(chunk_len as u16).to_le_bytes());
+        header[6] = record_type as u8;
+
+        failpoint::write_all("manifest:write_header", file, &header)?;
+        failpoint::write_all("manifest:write_payload", file, chunk)?;
+
+        *offset_in_block += HEADER_SIZE + chunk_len;
+        remaining = &remaining[chunk_len..];
+        is_first = false;
+    }
+
+    Ok(())
 }
 
 fn apply_records(records: Vec<Vec<u8>>) -> Result<VersionSet> {

@@ -15,6 +15,8 @@ pub struct Options {
     pub level_multiplier: u64,
     pub bloom_bits_per_key: u8,
     pub block_cache_capacity_bytes: usize,
+    pub event_log_capacity: usize,
+    pub manifest_checkpoint_target_bytes: u64,
 }
 
 impl Default for Options {
@@ -29,6 +31,8 @@ impl Default for Options {
             level_multiplier: 10,
             bloom_bits_per_key: 10,
             block_cache_capacity_bytes: 64 * 1024 * 1024,
+            event_log_capacity: 256,
+            manifest_checkpoint_target_bytes: 4 * 1024 * 1024,
         }
     }
 }
