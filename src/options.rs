@@ -17,6 +17,8 @@ pub struct Options {
     pub block_cache_capacity_bytes: usize,
     pub event_log_capacity: usize,
     pub manifest_checkpoint_target_bytes: u64,
+    pub drop_obsolete_versions_during_compaction: bool,
+    pub ttl_filter_from_value_prefix_micros: bool,
 }
 
 impl Default for Options {
@@ -33,6 +35,8 @@ impl Default for Options {
             block_cache_capacity_bytes: 64 * 1024 * 1024,
             event_log_capacity: 256,
             manifest_checkpoint_target_bytes: 4 * 1024 * 1024,
+            drop_obsolete_versions_during_compaction: true,
+            ttl_filter_from_value_prefix_micros: false,
         }
     }
 }

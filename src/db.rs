@@ -1096,8 +1096,57 @@ fn compact_l0_to_l1(db_dir: &Path, w: &mut WriterState) -> Result<()> {
     }
 
     let mut builder = TableBuilder::create(&tmp_path, w.options.bloom_bits_per_key)?;
+    let now_micros = now_micros();
+    let smallest_snapshot = u64::MAX;
+    let mut current_user_key: Option<Vec<u8>> = None;
+    let mut kept_snapshot_version_for_user_key = false;
     while let Some(Reverse(e)) = heap.pop() {
-        builder.add(&e.key, &e.value)?;
+        let (user_key, seq, value_type) = {
+            let parsed = parse_internal_key(&e.key)?;
+            (parsed.user_key.to_vec(), parsed.seq, parsed.value_type)
+        };
+        let is_new_user_key = match current_user_key.as_ref() {
+            Some(cur) => cur.as_slice() != user_key.as_slice(),
+            None => true,
+        };
+        if is_new_user_key {
+            current_user_key = Some(user_key.clone());
+            kept_snapshot_version_for_user_key = false;
+        }
+
+        let mut out_key = e.key;
+        let mut out_value = e.value;
+
+        if w.options.ttl_filter_from_value_prefix_micros
+            && value_type == ValueType::Value
+            && out_value.len() >= 8
+        {
+            let expiry = u64::from_le_bytes(out_value[..8].try_into().unwrap_or([0u8; 8]));
+            if expiry <= now_micros {
+                out_key = encode_internal_key(&user_key, seq, ValueType::Tombstone);
+                out_value.clear();
+            }
+        }
+
+        if w.options.drop_obsolete_versions_during_compaction && kept_snapshot_version_for_user_key
+        {
+            let src = e.src;
+            let next = sources[src].scanner.next_item()?;
+            sources[src].current = next;
+            if let Some((nk, nv)) = &sources[src].current {
+                heap.push(Reverse(HeapEntry {
+                    key: nk.clone(),
+                    src,
+                    value: nv.clone(),
+                }));
+            }
+            continue;
+        }
+
+        builder.add(&out_key, &out_value)?;
+        if w.options.drop_obsolete_versions_during_compaction && seq <= smallest_snapshot {
+            kept_snapshot_version_for_user_key = true;
+        }
         let src = e.src;
         let next = sources[src].scanner.next_item()?;
         sources[src].current = next;
@@ -1277,8 +1326,57 @@ fn compact_level_to_next(db_dir: &Path, w: &mut WriterState, level: usize) -> Re
     }
 
     let mut builder = TableBuilder::create(&tmp_path, w.options.bloom_bits_per_key)?;
+    let now_micros = now_micros();
+    let smallest_snapshot = u64::MAX;
+    let mut current_user_key: Option<Vec<u8>> = None;
+    let mut kept_snapshot_version_for_user_key = false;
     while let Some(Reverse(e)) = heap.pop() {
-        builder.add(&e.key, &e.value)?;
+        let (user_key, seq, value_type) = {
+            let parsed = parse_internal_key(&e.key)?;
+            (parsed.user_key.to_vec(), parsed.seq, parsed.value_type)
+        };
+        let is_new_user_key = match current_user_key.as_ref() {
+            Some(cur) => cur.as_slice() != user_key.as_slice(),
+            None => true,
+        };
+        if is_new_user_key {
+            current_user_key = Some(user_key.clone());
+            kept_snapshot_version_for_user_key = false;
+        }
+
+        let mut out_key = e.key;
+        let mut out_value = e.value;
+
+        if w.options.ttl_filter_from_value_prefix_micros
+            && value_type == ValueType::Value
+            && out_value.len() >= 8
+        {
+            let expiry = u64::from_le_bytes(out_value[..8].try_into().unwrap_or([0u8; 8]));
+            if expiry <= now_micros {
+                out_key = encode_internal_key(&user_key, seq, ValueType::Tombstone);
+                out_value.clear();
+            }
+        }
+
+        if w.options.drop_obsolete_versions_during_compaction && kept_snapshot_version_for_user_key
+        {
+            let src = e.src;
+            let next = sources[src].scanner.next_item()?;
+            sources[src].current = next;
+            if let Some((nk, nv)) = &sources[src].current {
+                heap.push(Reverse(HeapEntry {
+                    key: nk.clone(),
+                    src,
+                    value: nv.clone(),
+                }));
+            }
+            continue;
+        }
+
+        builder.add(&out_key, &out_value)?;
+        if w.options.drop_obsolete_versions_during_compaction && seq <= smallest_snapshot {
+            kept_snapshot_version_for_user_key = true;
+        }
         let src = e.src;
         let next = sources[src].scanner.next_item()?;
         sources[src].current = next;
@@ -1805,6 +1903,100 @@ mod tests {
         assert_eq!(db.get(b"b").unwrap(), None);
         assert_eq!(db.get(b"c").unwrap(), Some(b"3".to_vec()));
         db.close().unwrap();
+    }
+
+    #[test]
+    fn compaction_drops_obsolete_versions_when_enabled() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("db");
+        let opts = Options {
+            sync: SyncMode::No,
+            memtable_max_bytes: 1,
+            l0_slowdown_trigger: 0,
+            l0_stop_trigger: 1000,
+            drop_obsolete_versions_during_compaction: true,
+            ..Options::default()
+        };
+
+        let db = DB::open(&path, opts).unwrap();
+        db.put(b"k", b"v1").unwrap();
+        db.put(b"k", b"v2").unwrap();
+        db.close().unwrap();
+
+        let db2 = DB::open(&path, Options::default()).unwrap();
+        let w = db2.shared.state.lock().unwrap();
+        let file_ids: Vec<u64> = w
+            .version
+            .levels
+            .iter()
+            .flat_map(|l| l.iter().map(|m| m.file_id))
+            .collect();
+        drop(w);
+
+        let mut count = 0usize;
+        for file_id in file_ids {
+            let sst_path = path.join(sst_file_name(file_id));
+            let reader = TableReader::open_with_cache(sst_path, None).unwrap();
+            let mut it = reader.scanner();
+            while let Some((k, _v)) = it.next_item().unwrap() {
+                let parsed = parse_internal_key(&k).unwrap();
+                if parsed.user_key == encode_cf_user_key(0, b"k").as_slice() {
+                    count += 1;
+                }
+            }
+        }
+        assert_eq!(count, 1);
+        db2.close().unwrap();
+    }
+
+    #[test]
+    fn ttl_filter_turns_expired_values_into_tombstones_in_compaction() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("db");
+        let opts = Options {
+            sync: SyncMode::No,
+            memtable_max_bytes: 1,
+            l0_slowdown_trigger: 0,
+            l0_stop_trigger: 1000,
+            ttl_filter_from_value_prefix_micros: true,
+            ..Options::default()
+        };
+
+        let db = DB::open(&path, opts).unwrap();
+        let mut expired = Vec::new();
+        expired.extend_from_slice(&0u64.to_le_bytes());
+        expired.extend_from_slice(b"v");
+        db.put(b"k", &expired).unwrap();
+        db.put(b"x", b"y").unwrap();
+        db.close().unwrap();
+
+        let db2 = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(db2.get(b"k").unwrap(), None);
+        let w = db2.shared.state.lock().unwrap();
+        let file_ids: Vec<u64> = w
+            .version
+            .levels
+            .iter()
+            .flat_map(|l| l.iter().map(|m| m.file_id))
+            .collect();
+        drop(w);
+
+        let mut saw_tombstone = false;
+        for file_id in file_ids {
+            let sst_path = path.join(sst_file_name(file_id));
+            let reader = TableReader::open_with_cache(sst_path, None).unwrap();
+            let mut it = reader.scanner();
+            while let Some((k, v)) = it.next_item().unwrap() {
+                let parsed = parse_internal_key(&k).unwrap();
+                if parsed.user_key == encode_cf_user_key(0, b"k").as_slice() {
+                    assert_eq!(parsed.value_type, ValueType::Tombstone);
+                    assert!(v.is_empty());
+                    saw_tombstone = true;
+                }
+            }
+        }
+        assert!(saw_tombstone);
+        db2.close().unwrap();
     }
 
     #[test]
