@@ -2774,7 +2774,7 @@ mod tests {
         let db = DB::open(&path, opts).unwrap();
         for i in 0..20u8 {
             let k = [b'k', i];
-            db.put(&k, &vec![b'x'; 80]).unwrap();
+            db.put(&k, &[b'x'; 80]).unwrap();
         }
 
         for _ in 0..500 {
