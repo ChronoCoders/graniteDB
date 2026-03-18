@@ -53,7 +53,7 @@ impl MemDb {
             let seq = g.next_seq;
             g.next_seq = g.next_seq.saturating_add(1);
             match op {
-                WriteOp::Put { key, value } => {
+                WriteOp::Put { key, value, .. } => {
                     g.memtable.insert(
                         key,
                         seq,
@@ -61,7 +61,7 @@ impl MemDb {
                         value.clone(),
                     );
                 }
-                WriteOp::Delete { key } => {
+                WriteOp::Delete { key, .. } => {
                     g.memtable.insert(
                         key,
                         seq,

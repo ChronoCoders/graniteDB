@@ -24,6 +24,24 @@ pub struct Snapshot {
     pub read_seq: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReadOptions {
+    pub snapshot: Snapshot,
+}
+
+impl Default for ReadOptions {
+    fn default() -> Self {
+        Self {
+            snapshot: Snapshot { read_seq: u64::MAX },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WriteOptions {
+    pub sync: Option<SyncMode>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ColumnFamily {
     pub id: u32,
@@ -371,20 +389,33 @@ impl DB {
     }
 
     pub fn write_batch(&self, batch: WriteBatch) -> Result<()> {
-        self.write_batch_in_cf(0, batch)
+        self.write_batch_with_options(batch, WriteOptions::default())
+    }
+
+    pub fn write_batch_with_options(
+        &self,
+        batch: WriteBatch,
+        write_options: WriteOptions,
+    ) -> Result<()> {
+        self.write_batch_raw(batch, write_options)
     }
 
     fn put_cf_id(&self, cf_id: u32, key: &[u8], value: &[u8]) -> Result<()> {
-        let batch = WriteBatch::default().put(key.to_vec(), value.to_vec());
+        let batch = WriteBatch::default().put_cf(cf_id, key.to_vec(), value.to_vec());
         self.write_batch_in_cf(cf_id, batch)
     }
 
     fn delete_cf_id(&self, cf_id: u32, key: &[u8]) -> Result<()> {
-        let batch = WriteBatch::default().delete(key.to_vec());
+        let batch = WriteBatch::default().delete_cf(cf_id, key.to_vec());
         self.write_batch_in_cf(cf_id, batch)
     }
 
     fn write_batch_in_cf(&self, cf_id: u32, batch: WriteBatch) -> Result<()> {
+        let batch = set_batch_cf_id(cf_id, batch);
+        self.write_batch_raw(batch, WriteOptions::default())
+    }
+
+    fn write_batch_raw(&self, batch: WriteBatch, write_options: WriteOptions) -> Result<()> {
         let mut w = self
             .shared
             .state
@@ -394,8 +425,6 @@ impl DB {
         if let Some(e) = w.bg_error.take() {
             return Err(e);
         }
-
-        let batch = prefix_write_batch(cf_id, batch);
 
         let op_index = w.next_op_index;
         w.next_op_index = w.next_op_index.saturating_add(1);
@@ -447,7 +476,8 @@ impl DB {
         let start_seq = w.next_seq;
         let record = encode_batch_as_wal_record(&batch, start_seq);
         w.wal.append_logical_record(&record)?;
-        if w.options.sync == SyncMode::Yes {
+        let sync = write_options.sync.unwrap_or(w.options.sync);
+        if sync == SyncMode::Yes {
             w.wal.sync()?;
         }
         apply_batch_to_memtable_at_seq(&mut w.memtable, &batch, start_seq);
@@ -519,8 +549,25 @@ impl DB {
         self.get_cf_with_snapshot_id(0, key, Snapshot { read_seq: u64::MAX })
     }
 
+    pub fn get_with_options(
+        &self,
+        key: &[u8],
+        read_options: ReadOptions,
+    ) -> Result<Option<Vec<u8>>> {
+        self.get_cf_with_snapshot_id(0, key, read_options.snapshot)
+    }
+
     pub fn get_cf(&self, cf: &ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.get_cf_with_snapshot_id(cf.id, key, Snapshot { read_seq: u64::MAX })
+    }
+
+    pub fn get_cf_with_options(
+        &self,
+        cf: &ColumnFamily,
+        key: &[u8],
+        read_options: ReadOptions,
+    ) -> Result<Option<Vec<u8>>> {
+        self.get_cf_with_snapshot_id(cf.id, key, read_options.snapshot)
     }
 
     pub fn get_with_snapshot(&self, key: &[u8], snapshot: Snapshot) -> Result<Option<Vec<u8>>> {
@@ -1510,18 +1557,17 @@ fn split_cf_user_key(user_key: &[u8]) -> Result<(u32, &[u8])> {
     Ok((cf_id, &user_key[4..]))
 }
 
-fn prefix_write_batch(cf_id: u32, batch: WriteBatch) -> WriteBatch {
+fn set_batch_cf_id(cf_id: u32, batch: WriteBatch) -> WriteBatch {
     let ops = batch
         .ops
         .into_iter()
         .map(|op| match op {
-            WriteOp::Put { key, value } => WriteOp::Put {
-                key: encode_cf_user_key(cf_id, &key),
+            WriteOp::Put {
+                cf_id: _,
+                key,
                 value,
-            },
-            WriteOp::Delete { key } => WriteOp::Delete {
-                key: encode_cf_user_key(cf_id, &key),
-            },
+            } => WriteOp::Put { cf_id, key, value },
+            WriteOp::Delete { cf_id: _, key } => WriteOp::Delete { cf_id, key },
         })
         .collect();
     WriteBatch { ops }
@@ -1560,11 +1606,13 @@ fn apply_batch_to_memtable_at_seq(memtable: &mut MemTable, batch: &WriteBatch, s
     let mut seq = start_seq;
     for op in &batch.ops {
         match op {
-            WriteOp::Put { key, value } => {
-                memtable.insert(key, seq, ValueType::Value, value.clone());
+            WriteOp::Put { cf_id, key, value } => {
+                let k = encode_cf_user_key(*cf_id, key);
+                memtable.insert(&k, seq, ValueType::Value, value.clone());
             }
-            WriteOp::Delete { key } => {
-                memtable.insert(key, seq, ValueType::Tombstone, Vec::new());
+            WriteOp::Delete { cf_id, key } => {
+                let k = encode_cf_user_key(*cf_id, key);
+                memtable.insert(&k, seq, ValueType::Tombstone, Vec::new());
             }
         }
         seq = seq.saturating_add(1);

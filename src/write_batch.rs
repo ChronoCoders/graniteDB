@@ -2,8 +2,15 @@ use crate::error::{GraniteError, Result};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WriteOp {
-    Put { key: Vec<u8>, value: Vec<u8> },
-    Delete { key: Vec<u8> },
+    Put {
+        cf_id: u32,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    },
+    Delete {
+        cf_id: u32,
+        key: Vec<u8>,
+    },
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -14,6 +21,21 @@ pub struct WriteBatch {
 impl WriteBatch {
     pub fn put(mut self, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> Self {
         self.ops.push(WriteOp::Put {
+            cf_id: 0,
+            key: key.into(),
+            value: value.into(),
+        });
+        self
+    }
+
+    pub fn put_cf(
+        mut self,
+        cf_id: u32,
+        key: impl Into<Vec<u8>>,
+        value: impl Into<Vec<u8>>,
+    ) -> Self {
+        self.ops.push(WriteOp::Put {
+            cf_id,
             key: key.into(),
             value: value.into(),
         });
@@ -21,7 +43,18 @@ impl WriteBatch {
     }
 
     pub fn delete(mut self, key: impl Into<Vec<u8>>) -> Self {
-        self.ops.push(WriteOp::Delete { key: key.into() });
+        self.ops.push(WriteOp::Delete {
+            cf_id: 0,
+            key: key.into(),
+        });
+        self
+    }
+
+    pub fn delete_cf(mut self, cf_id: u32, key: impl Into<Vec<u8>>) -> Self {
+        self.ops.push(WriteOp::Delete {
+            cf_id,
+            key: key.into(),
+        });
         self
     }
 
@@ -30,15 +63,17 @@ impl WriteBatch {
         out.extend_from_slice(&(self.ops.len() as u32).to_le_bytes());
         for op in &self.ops {
             match op {
-                WriteOp::Put { key, value } => {
-                    out.push(1u8);
+                WriteOp::Put { cf_id, key, value } => {
+                    out.push(3u8);
+                    out.extend_from_slice(&cf_id.to_le_bytes());
                     out.extend_from_slice(&(key.len() as u32).to_le_bytes());
                     out.extend_from_slice(key);
                     out.extend_from_slice(&(value.len() as u32).to_le_bytes());
                     out.extend_from_slice(value);
                 }
-                WriteOp::Delete { key } => {
-                    out.push(2u8);
+                WriteOp::Delete { cf_id, key } => {
+                    out.push(4u8);
+                    out.extend_from_slice(&cf_id.to_le_bytes());
                     out.extend_from_slice(&(key.len() as u32).to_le_bytes());
                     out.extend_from_slice(key);
                 }
@@ -56,11 +91,26 @@ impl WriteBatch {
                 1 => {
                     let key = read_bytes(&mut bytes)?;
                     let value = read_bytes(&mut bytes)?;
-                    ops.push(WriteOp::Put { key, value });
+                    ops.push(WriteOp::Put {
+                        cf_id: 0,
+                        key,
+                        value,
+                    });
                 }
                 2 => {
                     let key = read_bytes(&mut bytes)?;
-                    ops.push(WriteOp::Delete { key });
+                    ops.push(WriteOp::Delete { cf_id: 0, key });
+                }
+                3 => {
+                    let cf_id = read_u32(&mut bytes)?;
+                    let key = read_bytes(&mut bytes)?;
+                    let value = read_bytes(&mut bytes)?;
+                    ops.push(WriteOp::Put { cf_id, key, value });
+                }
+                4 => {
+                    let cf_id = read_u32(&mut bytes)?;
+                    let key = read_bytes(&mut bytes)?;
+                    ops.push(WriteOp::Delete { cf_id, key });
                 }
                 _ => return Err(GraniteError::Corrupt("unknown op type")),
             }
@@ -112,7 +162,9 @@ mod tests {
     fn batch_roundtrip() {
         let batch = WriteBatch::default()
             .put(b"a".to_vec(), b"1".to_vec())
-            .delete(b"b".to_vec());
+            .delete(b"b".to_vec())
+            .put_cf(7, b"k".to_vec(), b"v".to_vec())
+            .delete_cf(7, b"k".to_vec());
         let enc = batch.encode();
         let dec = WriteBatch::decode(&enc).unwrap();
         assert_eq!(batch, dec);
