@@ -4,7 +4,7 @@ use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::error::{GraniteError, Result};
 use crate::failpoint;
@@ -125,6 +125,10 @@ pub enum DbEventKind {
     BackgroundError,
 }
 
+pub trait DbEventListener: Send + Sync {
+    fn on_event(&self, event: &DbEvent);
+}
+
 struct WriterState {
     manifest: Manifest,
     version: VersionSet,
@@ -145,6 +149,7 @@ struct WriterState {
     next_cf_id: u32,
     metrics: DbMetrics,
     events: VecDeque<DbEvent>,
+    event_listener: Option<Arc<dyn DbEventListener>>,
     options: Options,
 }
 
@@ -152,11 +157,47 @@ pub struct DB {
     path: PathBuf,
     shared: Arc<Shared>,
     bg: Mutex<Option<JoinHandle<()>>>,
+    rate_limiter: Mutex<RateLimiter>,
 }
 
 struct Shared {
     state: Mutex<WriterState>,
     cv: Condvar,
+}
+
+struct RateLimiter {
+    bytes_per_sec: u64,
+    available: u64,
+    last: Instant,
+}
+
+impl RateLimiter {
+    fn new(bytes_per_sec: u64) -> Self {
+        Self {
+            bytes_per_sec,
+            available: bytes_per_sec,
+            last: Instant::now(),
+        }
+    }
+
+    fn reserve_sleep(&mut self, bytes: u64) -> Option<Duration> {
+        if self.bytes_per_sec == 0 {
+            return None;
+        }
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last);
+        let added = (elapsed.as_secs_f64() * self.bytes_per_sec as f64) as u64;
+        self.available = (self.available.saturating_add(added)).min(self.bytes_per_sec);
+        self.last = now;
+        if self.available >= bytes {
+            self.available -= bytes;
+            return None;
+        }
+        let missing = bytes - self.available;
+        self.available = 0;
+        let secs = missing as f64 / self.bytes_per_sec as f64;
+        Some(Duration::from_secs_f64(secs))
+    }
 }
 
 fn now_micros() -> u64 {
@@ -170,15 +211,25 @@ impl WriterState {
     fn record_event(&mut self, kind: DbEventKind) {
         let cap = self.options.event_log_capacity;
         if cap == 0 {
+            if let Some(listener) = &self.event_listener {
+                listener.on_event(&DbEvent {
+                    at_micros: now_micros(),
+                    kind,
+                });
+            }
             return;
         }
         while self.events.len() >= cap {
             self.events.pop_front();
         }
-        self.events.push_back(DbEvent {
+        let e = DbEvent {
             at_micros: now_micros(),
             kind,
-        });
+        };
+        self.events.push_back(e.clone());
+        if let Some(listener) = &self.event_listener {
+            listener.on_event(&e);
+        }
     }
 }
 
@@ -187,6 +238,7 @@ impl DB {
         let path = path.as_ref().to_path_buf();
         fs::create_dir_all(&path)?;
 
+        let max_write_bytes_per_sec = options.max_write_bytes_per_sec;
         let block_cache = Arc::new(BlockCache::new(options.block_cache_capacity_bytes));
         let (manifest, mut version) = Manifest::open(&path, options.sync)?;
         let max_levels = options.max_levels.max(2);
@@ -256,6 +308,7 @@ impl DB {
                 next_cf_id,
                 metrics: DbMetrics::default(),
                 events: VecDeque::new(),
+                event_listener: None,
                 options,
             }),
             cv: Condvar::new(),
@@ -265,6 +318,7 @@ impl DB {
             path: path.clone(),
             shared: shared.clone(),
             bg: Mutex::new(None),
+            rate_limiter: Mutex::new(RateLimiter::new(max_write_bytes_per_sec)),
         };
 
         let handle = std::thread::spawn({
@@ -276,6 +330,20 @@ impl DB {
             .map_err(|_| GraniteError::Corrupt("poisoned"))? = Some(handle);
         db.shared.cv.notify_all();
         Ok(db)
+    }
+
+    fn rate_limit_bytes(&self, bytes: u64) -> Result<()> {
+        let sleep = {
+            let mut rl = self
+                .rate_limiter
+                .lock()
+                .map_err(|_| GraniteError::Corrupt("poisoned"))?;
+            rl.reserve_sleep(bytes)
+        };
+        if let Some(d) = sleep {
+            std::thread::sleep(d);
+        }
+        Ok(())
     }
 
     pub fn close(&self) -> Result<()> {
@@ -317,6 +385,65 @@ impl DB {
             batch: WriteBatch::default(),
             write_options: WriteOptions::default(),
         })
+    }
+
+    pub fn set_event_listener(&self, listener: Option<Arc<dyn DbEventListener>>) -> Result<()> {
+        let mut w = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| GraniteError::Corrupt("poisoned"))?;
+        w.event_listener = listener;
+        Ok(())
+    }
+
+    pub fn get_property(&self, name: &str) -> Result<Option<String>> {
+        let w = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| GraniteError::Corrupt("poisoned"))?;
+        match name {
+            "granitedb.stats" => {
+                let mut s = String::new();
+                s.push_str(&format!("puts: {}\n", w.metrics.puts));
+                s.push_str(&format!("deletes: {}\n", w.metrics.deletes));
+                s.push_str(&format!("write_batches: {}\n", w.metrics.write_batches));
+                s.push_str(&format!("stall_waits: {}\n", w.metrics.stall_waits));
+                s.push_str(&format!("flushes: {}\n", w.metrics.flushes));
+                s.push_str(&format!("compactions: {}\n", w.metrics.compactions));
+                s.push_str(&format!(
+                    "background_errors: {}\n",
+                    w.metrics.background_errors
+                ));
+                s.push_str(&format!("checkpoints: {}\n", w.metrics.checkpoints));
+                for (i, level) in w.version.levels.iter().enumerate() {
+                    let files = level.len();
+                    let bytes: u64 = level.iter().map(|m| m.file_size).sum();
+                    s.push_str(&format!("level_{i}_files: {files}\n"));
+                    s.push_str(&format!("level_{i}_bytes: {bytes}\n"));
+                }
+                Ok(Some(s))
+            }
+            "granitedb.options" => Ok(Some(format!(
+                "sync: {:?}\nmemtable_max_bytes: {}\nl0_slowdown_trigger: {}\nl0_stop_trigger: {}\nmax_levels: {}\nlevel1_target_bytes: {}\nlevel_multiplier: {}\nbloom_bits_per_key: {}\nblock_cache_capacity_bytes: {}\nmanifest_checkpoint_target_bytes: {}\ndrop_obsolete_versions_during_compaction: {}\nttl_filter_from_value_prefix_micros: {}\nsstable_compression: {:?}\nmax_write_bytes_per_sec: {}\n",
+                w.options.sync,
+                w.options.memtable_max_bytes,
+                w.options.l0_slowdown_trigger,
+                w.options.l0_stop_trigger,
+                w.options.max_levels,
+                w.options.level1_target_bytes,
+                w.options.level_multiplier,
+                w.options.bloom_bits_per_key,
+                w.options.block_cache_capacity_bytes,
+                w.options.manifest_checkpoint_target_bytes,
+                w.options.drop_obsolete_versions_during_compaction,
+                w.options.ttl_filter_from_value_prefix_micros,
+                w.options.sstable_compression,
+                w.options.max_write_bytes_per_sec
+            ))),
+            _ => Ok(None),
+        }
     }
 
     pub fn create_checkpoint(&self, dest_dir: impl AsRef<Path>) -> Result<()> {
@@ -574,6 +701,7 @@ impl DB {
     }
 
     fn write_batch_raw(&self, batch: WriteBatch, write_options: WriteOptions) -> Result<()> {
+        self.rate_limit_bytes(wal_record_len_for_batch(&batch))?;
         let mut w = self
             .shared
             .state
@@ -700,6 +828,7 @@ impl DB {
         batch: WriteBatch,
         write_options: WriteOptions,
     ) -> Result<()> {
+        self.rate_limit_bytes(wal_record_len_for_batch(&batch))?;
         for op in &batch.ops {
             match op {
                 WriteOp::Put { cf_id, key, .. } => {
@@ -1185,6 +1314,37 @@ fn inspect_sstable(path: &Path, cache: Arc<BlockCache>) -> Result<(Vec<u8>, Vec<
     let smallest = smallest.ok_or(GraniteError::Corrupt("empty table"))?;
     let largest = largest.ok_or(GraniteError::Corrupt("empty table"))?;
     Ok((smallest, largest, max_seq))
+}
+
+fn wal_record_len_for_batch(batch: &WriteBatch) -> u64 {
+    (8u64)
+        .saturating_add(4)
+        .saturating_add(encoded_write_batch_len(batch) as u64)
+}
+
+fn encoded_write_batch_len(batch: &WriteBatch) -> usize {
+    let mut out = 4usize;
+    for op in &batch.ops {
+        match op {
+            WriteOp::Put { key, value, .. } => {
+                out = out
+                    .saturating_add(1)
+                    .saturating_add(4)
+                    .saturating_add(4)
+                    .saturating_add(key.len())
+                    .saturating_add(4)
+                    .saturating_add(value.len());
+            }
+            WriteOp::Delete { key, .. } => {
+                out = out
+                    .saturating_add(1)
+                    .saturating_add(4)
+                    .saturating_add(4)
+                    .saturating_add(key.len());
+            }
+        }
+    }
+    out
 }
 
 fn wal_file_name(file_id: u64) -> String {
