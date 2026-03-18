@@ -23,9 +23,23 @@ fn main() {
     };
     let scenario = args.next().unwrap_or_else(|| "random".into());
 
-    let opts = Options {
-        sync,
-        ..Options::default()
+    let opts = match scenario.as_str() {
+        "flush" => Options {
+            sync,
+            memtable_max_bytes: 1,
+            l0_slowdown_trigger: 1000,
+            l0_stop_trigger: 2000,
+        },
+        "compaction" => Options {
+            sync,
+            memtable_max_bytes: 1,
+            l0_slowdown_trigger: 1,
+            l0_stop_trigger: 2,
+        },
+        _ => Options {
+            sync,
+            ..Options::default()
+        },
     };
     let db = DB::open(&db_path, opts).expect("open db");
 
@@ -37,6 +51,8 @@ fn main() {
 
     match scenario.as_str() {
         "padding" => run_padding_scenario(&db, seed, &mut ack_log),
+        "flush" => run_flush_scenario(&db, seed, &mut ack_log),
+        "compaction" => run_compaction_scenario(&db, seed, &mut ack_log),
         _ => run_random_scenario(&db, seed, op_count, &mut ack_log),
     };
     db.close().expect("close");
@@ -77,6 +93,21 @@ fn run_padding_scenario(db: &DB, seed: u64, ack_log: &mut std::fs::File) {
     db.put(b"k", &value).expect("put large");
     log_acked_write(ack_log, 0);
     db.put(b"x", b"y").expect("put small");
+    log_acked_write(ack_log, 1);
+}
+
+fn run_flush_scenario(db: &DB, seed: u64, ack_log: &mut std::fs::File) {
+    let value = format!("flush:{seed}").into_bytes();
+    db.put(b"a", &value).expect("put flush");
+    log_acked_write(ack_log, 0);
+}
+
+fn run_compaction_scenario(db: &DB, seed: u64, ack_log: &mut std::fs::File) {
+    let v1 = format!("c1:{seed}").into_bytes();
+    let v2 = format!("c2:{seed}").into_bytes();
+    db.put(b"a", &v1).expect("put 1");
+    log_acked_write(ack_log, 0);
+    db.put(b"b", &v2).expect("put 2");
     log_acked_write(ack_log, 1);
 }
 

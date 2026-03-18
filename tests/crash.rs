@@ -43,6 +43,58 @@ fn crash_in_wal_write_does_not_corrupt_and_preserves_prefix() {
         "padding",
         SyncMode::Yes,
     );
+
+    for failpoint in [
+        "flush:before_new_wal_create",
+        "flush:after_new_wal_create",
+        "flush:before_sst_finish",
+        "flush:after_sst_finish",
+        "flush:before_sst_rename",
+        "flush:after_sst_rename",
+        "flush:before_dir_sync",
+        "flush:after_dir_sync",
+        "flush:before_manifest_edit",
+        "flush:after_manifest_edit",
+        "manifest:before_append",
+        "manifest:after_append",
+        "manifest:before_sync",
+        "manifest:after_sync",
+    ] {
+        run_crash_case(
+            &base_path,
+            seed,
+            op_count,
+            0,
+            failpoint,
+            "flush",
+            SyncMode::Yes,
+        );
+    }
+
+    for failpoint in [
+        "compaction:before_sst_finish",
+        "compaction:after_sst_finish",
+        "compaction:before_sst_rename",
+        "compaction:after_sst_rename",
+        "compaction:before_dir_sync",
+        "compaction:after_dir_sync",
+        "compaction:before_manifest_edit",
+        "compaction:after_manifest_edit",
+        "manifest:before_append",
+        "manifest:after_append",
+        "manifest:before_sync",
+        "manifest:after_sync",
+    ] {
+        run_crash_case(
+            &base_path,
+            seed,
+            op_count,
+            1,
+            failpoint,
+            "compaction",
+            SyncMode::Yes,
+        );
+    }
 }
 
 fn run_crash_case(
@@ -133,6 +185,23 @@ fn compute_expected_state(
             }
             if writes_to_apply >= 2 {
                 state.insert(b"x".to_vec(), Some(b"y".to_vec()));
+            }
+            state
+        }
+        "flush" => {
+            let mut state = BTreeMap::new();
+            if writes_to_apply >= 1 {
+                state.insert(b"a".to_vec(), Some(format!("flush:{seed}").into_bytes()));
+            }
+            state
+        }
+        "compaction" => {
+            let mut state = BTreeMap::new();
+            if writes_to_apply >= 1 {
+                state.insert(b"a".to_vec(), Some(format!("c1:{seed}").into_bytes()));
+            }
+            if writes_to_apply >= 2 {
+                state.insert(b"b".to_vec(), Some(format!("c2:{seed}").into_bytes()));
             }
             state
         }

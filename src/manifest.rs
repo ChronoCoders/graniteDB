@@ -3,6 +3,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::error::{GraniteError, Result};
+use crate::failpoint;
 use crate::options::SyncMode;
 use crate::sstable::FileMeta;
 use crate::util::{sync_dir, sync_parent_dir};
@@ -31,13 +32,17 @@ impl RecordType {
     }
 }
 
-const REC_ADD_FILE: u8 = 1;
-const REC_DELETE_FILE: u8 = 2;
+const TAG_ADD_FILE: u8 = 1;
+const TAG_DELETE_FILE: u8 = 2;
+const TAG_SET_LOG_NUMBER: u8 = 3;
+const TAG_SET_LAST_SEQUENCE: u8 = 4;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct VersionSet {
     pub level0: Vec<FileMeta>,
     pub level1: Vec<FileMeta>,
+    pub log_number: u64,
+    pub last_sequence: u64,
 }
 
 impl VersionSet {
@@ -53,6 +58,17 @@ impl VersionSet {
     pub fn contains_file_id(&self, file_id: u64) -> bool {
         self.level0.iter().any(|m| m.file_id == file_id)
             || self.level1.iter().any(|m| m.file_id == file_id)
+    }
+}
+
+impl Default for VersionSet {
+    fn default() -> Self {
+        Self {
+            level0: Vec::new(),
+            level1: Vec::new(),
+            log_number: 1,
+            last_sequence: 0,
+        }
     }
 }
 
@@ -107,32 +123,45 @@ impl Manifest {
         ))
     }
 
-    pub fn append_add_file(&mut self, meta: &FileMeta) -> Result<()> {
+    pub fn append_flush_edit(
+        &mut self,
+        meta: &FileMeta,
+        new_log_number: u64,
+        last_sequence: u64,
+    ) -> Result<()> {
         let mut payload = Vec::new();
-        payload.push(REC_ADD_FILE);
-        payload.extend_from_slice(&meta.level.to_le_bytes());
-        payload.extend_from_slice(&meta.file_id.to_le_bytes());
-        payload.extend_from_slice(&meta.file_size.to_le_bytes());
-        payload.extend_from_slice(&(meta.smallest_key.len() as u32).to_le_bytes());
-        payload.extend_from_slice(&meta.smallest_key);
-        payload.extend_from_slice(&(meta.largest_key.len() as u32).to_le_bytes());
-        payload.extend_from_slice(&meta.largest_key);
+        encode_add_file(&mut payload, meta);
+        encode_set_log_number(&mut payload, new_log_number);
+        encode_set_last_sequence(&mut payload, last_sequence);
+        failpoint::hit("manifest:before_append");
         self.append_logical_record(&payload)?;
+        failpoint::hit("manifest:after_append");
         self.sync()
     }
 
-    pub fn append_delete_file(&mut self, level: u32, file_id: u64) -> Result<()> {
+    pub fn append_compaction_edit(
+        &mut self,
+        output: &FileMeta,
+        deletes: &[(u32, u64)],
+        last_sequence: u64,
+    ) -> Result<()> {
         let mut payload = Vec::new();
-        payload.push(REC_DELETE_FILE);
-        payload.extend_from_slice(&level.to_le_bytes());
-        payload.extend_from_slice(&file_id.to_le_bytes());
+        encode_add_file(&mut payload, output);
+        for (level, file_id) in deletes {
+            encode_delete_file(&mut payload, *level, *file_id);
+        }
+        encode_set_last_sequence(&mut payload, last_sequence);
+        failpoint::hit("manifest:before_append");
         self.append_logical_record(&payload)?;
+        failpoint::hit("manifest:after_append");
         self.sync()
     }
 
     pub fn sync(&mut self) -> Result<()> {
         if self.sync_mode == SyncMode::Yes {
+            failpoint::hit("manifest:before_sync");
             self.file.sync_data()?;
+            failpoint::hit("manifest:after_sync");
         }
         Ok(())
     }
@@ -200,45 +229,76 @@ fn apply_records(records: Vec<Vec<u8>>) -> Result<VersionSet> {
 }
 
 fn apply_one_record(version: &mut VersionSet, mut rec: &[u8]) -> Result<()> {
-    let typ = read_u8(&mut rec)?;
-    match typ {
-        REC_ADD_FILE => {
-            let level = read_u32(&mut rec)?;
-            let file_id = read_u64(&mut rec)?;
-            let file_size = read_u64(&mut rec)?;
-            let smallest_key = read_bytes(&mut rec)?;
-            let largest_key = read_bytes(&mut rec)?;
-            if !rec.is_empty() {
-                return Err(GraniteError::Corrupt("trailing bytes in AddFile"));
+    while !rec.is_empty() {
+        let tag = read_u8(&mut rec)?;
+        match tag {
+            TAG_ADD_FILE => {
+                let level = read_u32(&mut rec)?;
+                let file_id = read_u64(&mut rec)?;
+                let file_size = read_u64(&mut rec)?;
+                let smallest_key = read_bytes(&mut rec)?;
+                let largest_key = read_bytes(&mut rec)?;
+                let meta = FileMeta {
+                    level,
+                    file_id,
+                    file_size,
+                    smallest_key,
+                    largest_key,
+                };
+                match level {
+                    0 => version.level0.push(meta),
+                    1 => version.level1.push(meta),
+                    _ => return Err(GraniteError::InvalidArgument("only L0/L1 supported in v1")),
+                }
             }
-            let meta = FileMeta {
-                level,
-                file_id,
-                file_size,
-                smallest_key,
-                largest_key,
-            };
-            match level {
-                0 => version.level0.push(meta),
-                1 => version.level1.push(meta),
-                _ => return Err(GraniteError::InvalidArgument("only L0/L1 supported in v1")),
+            TAG_DELETE_FILE => {
+                let level = read_u32(&mut rec)?;
+                let file_id = read_u64(&mut rec)?;
+                match level {
+                    0 => version.level0.retain(|m| m.file_id != file_id),
+                    1 => version.level1.retain(|m| m.file_id != file_id),
+                    _ => return Err(GraniteError::InvalidArgument("only L0/L1 supported in v1")),
+                }
             }
+            TAG_SET_LOG_NUMBER => {
+                let log_number = read_u64(&mut rec)?;
+                version.log_number = log_number;
+            }
+            TAG_SET_LAST_SEQUENCE => {
+                let last_sequence = read_u64(&mut rec)?;
+                version.last_sequence = version.last_sequence.max(last_sequence);
+            }
+            _ => return Err(GraniteError::Corrupt("unknown manifest tag")),
         }
-        REC_DELETE_FILE => {
-            let level = read_u32(&mut rec)?;
-            let file_id = read_u64(&mut rec)?;
-            if !rec.is_empty() {
-                return Err(GraniteError::Corrupt("trailing bytes in DeleteFile"));
-            }
-            match level {
-                0 => version.level0.retain(|m| m.file_id != file_id),
-                1 => version.level1.retain(|m| m.file_id != file_id),
-                _ => return Err(GraniteError::InvalidArgument("only L0/L1 supported in v1")),
-            }
-        }
-        _ => return Err(GraniteError::Corrupt("unknown manifest record type")),
     }
     Ok(())
+}
+
+fn encode_add_file(out: &mut Vec<u8>, meta: &FileMeta) {
+    out.push(TAG_ADD_FILE);
+    out.extend_from_slice(&meta.level.to_le_bytes());
+    out.extend_from_slice(&meta.file_id.to_le_bytes());
+    out.extend_from_slice(&meta.file_size.to_le_bytes());
+    out.extend_from_slice(&(meta.smallest_key.len() as u32).to_le_bytes());
+    out.extend_from_slice(&meta.smallest_key);
+    out.extend_from_slice(&(meta.largest_key.len() as u32).to_le_bytes());
+    out.extend_from_slice(&meta.largest_key);
+}
+
+fn encode_delete_file(out: &mut Vec<u8>, level: u32, file_id: u64) {
+    out.push(TAG_DELETE_FILE);
+    out.extend_from_slice(&level.to_le_bytes());
+    out.extend_from_slice(&file_id.to_le_bytes());
+}
+
+fn encode_set_log_number(out: &mut Vec<u8>, log_number: u64) {
+    out.push(TAG_SET_LOG_NUMBER);
+    out.extend_from_slice(&log_number.to_le_bytes());
+}
+
+fn encode_set_last_sequence(out: &mut Vec<u8>, last_sequence: u64) {
+    out.push(TAG_SET_LAST_SEQUENCE);
+    out.extend_from_slice(&last_sequence.to_le_bytes());
 }
 
 fn recover_and_truncate(file: &mut File) -> Result<(Vec<Vec<u8>>, u64)> {
@@ -448,6 +508,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let (mut m, v0) = Manifest::open(dir.path(), SyncMode::No).unwrap();
         assert!(v0.level0.is_empty());
+        assert_eq!(v0.log_number, 1);
+        assert_eq!(v0.last_sequence, 0);
 
         let meta = FileMeta {
             level: 0,
@@ -456,7 +518,7 @@ mod tests {
             smallest_key: b"a".to_vec(),
             largest_key: b"z".to_vec(),
         };
-        m.append_add_file(&meta).unwrap();
+        m.append_flush_edit(&meta, 2, 9).unwrap();
         m.sync().unwrap();
 
         m.file.seek(SeekFrom::End(0)).unwrap();
@@ -466,5 +528,7 @@ mod tests {
         let (_m2, v2) = Manifest::open(dir.path(), SyncMode::No).unwrap();
         assert_eq!(v2.level0.len(), 1);
         assert_eq!(v2.level0[0].file_id, 7);
+        assert_eq!(v2.log_number, 2);
+        assert_eq!(v2.last_sequence, 9);
     }
 }

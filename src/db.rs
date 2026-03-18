@@ -75,23 +75,15 @@ impl DB {
         let next_file_id = version.max_file_id().saturating_add(1).max(1);
 
         let mut memtable = MemTable::default();
-        let mut next_seq = 1u64;
+        let mut next_seq = version.last_sequence.saturating_add(1).max(1);
 
-        let wal_ids = list_wal_ids(&path)?;
-        let wal_id = wal_ids.last().copied().unwrap_or(1);
-        for id in &wal_ids {
-            let wal_path = path.join(wal_file_name(*id));
-            let (wal, recovery) = Wal::open(&wal_path, options.sync)?;
-            for rec in recovery.records {
-                let batch = decode_wal_record_to_batch(&rec)?;
-                apply_batch_to_memtable(&mut memtable, &batch, &mut next_seq)?;
-            }
-            if *id != wal_id {
-                drop(wal);
-            }
-        }
+        let wal_id = version.log_number.max(1);
         let wal_path = path.join(wal_file_name(wal_id));
-        let (wal, _recovery) = Wal::open(&wal_path, options.sync)?;
+        let (wal, recovery) = Wal::open(&wal_path, options.sync)?;
+        for rec in recovery.records {
+            let batch = decode_wal_record_to_batch(&rec)?;
+            apply_batch_to_memtable(&mut memtable, &batch, &mut next_seq)?;
+        }
 
         Ok(Self {
             path,
@@ -262,16 +254,9 @@ fn startup_gc(db_dir: &Path, version: &VersionSet) -> Result<()> {
             let _ = fs::remove_file(path);
         }
     }
-    Ok(())
-}
 
-fn wal_file_name(file_id: u64) -> String {
-    format!("{file_id:06}.log")
-}
-
-fn list_wal_ids(db_dir: &Path) -> Result<Vec<u64>> {
-    let mut ids = Vec::new();
-    for e in fs::read_dir(db_dir)? {
+    let entries = fs::read_dir(db_dir)?;
+    for e in entries {
         let e = e?;
         let path = e.path();
         if path.extension().and_then(|s| s.to_str()) != Some("log") {
@@ -281,18 +266,19 @@ fn list_wal_ids(db_dir: &Path) -> Result<Vec<u64>> {
             Some(s) => s,
             None => continue,
         };
-        let id = match stem.parse::<u64>() {
+        let file_id = match stem.parse::<u64>() {
             Ok(id) => id,
             Err(_) => continue,
         };
-        ids.push(id);
+        if file_id < version.log_number.max(1) {
+            let _ = fs::remove_file(path);
+        }
     }
-    if ids.is_empty() {
-        ids.push(1);
-    }
-    ids.sort_unstable();
-    ids.dedup();
-    Ok(ids)
+    Ok(())
+}
+
+fn wal_file_name(file_id: u64) -> String {
+    format!("{file_id:06}.log")
 }
 
 fn sst_file_name(file_id: u64) -> String {
@@ -313,29 +299,50 @@ fn flush_memtable_to_l0(db_dir: &Path, w: &mut WriterState) -> Result<()> {
     let tmp_path = db_dir.join(sst_temp_file_name(file_id));
     let final_path = db_dir.join(sst_file_name(file_id));
 
+    let new_wal_id = w.wal_id.saturating_add(1);
+    let new_wal_path = db_dir.join(wal_file_name(new_wal_id));
+    failpoint::hit("flush:before_new_wal_create");
+    let (new_wal, _recovery) = Wal::open(&new_wal_path, w.options.sync)?;
+    drop(new_wal);
+    failpoint::hit("flush:after_new_wal_create");
+
     let mut builder = TableBuilder::create(&tmp_path)?;
     for (user_key, seq, value_type, value) in w.memtable.iter_user_entries() {
         let ik = encode_internal_key(user_key, seq, value_type);
         builder.add(&ik, value)?;
     }
+    failpoint::hit("flush:before_sst_finish");
     let mut meta = builder.finish(w.options.sync == SyncMode::Yes)?;
+    failpoint::hit("flush:after_sst_finish");
     meta.file_id = file_id;
     meta.level = 0;
 
+    failpoint::hit("flush:before_sst_rename");
     fs::rename(&tmp_path, &final_path)?;
+    failpoint::hit("flush:after_sst_rename");
     if w.options.sync == SyncMode::Yes {
+        failpoint::hit("flush:before_dir_sync");
         sync_parent_dir(&final_path)?;
+        failpoint::hit("flush:after_dir_sync");
     }
 
-    w.manifest.append_add_file(&meta)?;
+    let last_sequence = w.next_seq.saturating_sub(1);
+    failpoint::hit("flush:before_manifest_edit");
+    w.manifest
+        .append_flush_edit(&meta, new_wal_id, last_sequence)?;
+    failpoint::hit("flush:after_manifest_edit");
     w.version.level0.push(meta);
+    w.version.log_number = new_wal_id;
+    w.version.last_sequence = w.version.last_sequence.max(last_sequence);
 
     w.memtable = MemTable::default();
 
-    w.wal_id = w.wal_id.saturating_add(1);
+    let old_wal_id = w.wal_id;
+    w.wal_id = new_wal_id;
     let wal_path = db_dir.join(wal_file_name(w.wal_id));
     let (wal, _recovery) = Wal::open(&wal_path, w.options.sync)?;
     w.wal = wal;
+    let _ = fs::remove_file(db_dir.join(wal_file_name(old_wal_id)));
     Ok(())
 }
 
@@ -456,26 +463,35 @@ fn compact_l0_to_l1(db_dir: &Path, w: &mut WriterState) -> Result<()> {
             }));
         }
     }
+    failpoint::hit("compaction:before_sst_finish");
     let mut out_meta = builder.finish(w.options.sync == SyncMode::Yes)?;
+    failpoint::hit("compaction:after_sst_finish");
     out_meta.file_id = file_id;
     out_meta.level = 1;
     drop(sources);
 
+    failpoint::hit("compaction:before_sst_rename");
     fs::rename(&tmp_path, &final_path)?;
+    failpoint::hit("compaction:after_sst_rename");
     if w.options.sync == SyncMode::Yes {
+        failpoint::hit("compaction:before_dir_sync");
         sync_parent_dir(&final_path)?;
+        failpoint::hit("compaction:after_dir_sync");
     }
 
     let l0_ids: Vec<u64> = w.version.level0.iter().map(|m| m.file_id).collect();
     let overlap_ids_vec: Vec<u64> = overlap_l1.iter().map(|m| m.file_id).collect();
 
-    w.manifest.append_add_file(&out_meta)?;
-    for id in &l0_ids {
-        w.manifest.append_delete_file(0, *id)?;
-    }
-    for id in &overlap_ids_vec {
-        w.manifest.append_delete_file(1, *id)?;
-    }
+    let mut deletes: Vec<(u32, u64)> = Vec::new();
+    deletes.extend(l0_ids.iter().map(|id| (0u32, *id)));
+    deletes.extend(overlap_ids_vec.iter().map(|id| (1u32, *id)));
+
+    let last_sequence = w.next_seq.saturating_sub(1);
+    failpoint::hit("compaction:before_manifest_edit");
+    w.manifest
+        .append_compaction_edit(&out_meta, &deletes, last_sequence)?;
+    failpoint::hit("compaction:after_manifest_edit");
+    w.version.last_sequence = w.version.last_sequence.max(last_sequence);
 
     let overlap_ids: std::collections::BTreeSet<u64> = overlap_ids_vec.iter().copied().collect();
     w.version.level0.clear();

@@ -22,21 +22,25 @@ Recommended: reuse the WAL block-framed record format exactly (32KiB blocks, FUL
 
 ## 5.3 Manifest Record Payloads
 
-Each logical manifest record payload begins with:
+Each logical manifest record payload is a single atomic VersionEdit containing one or more tagged fields.
 
 ```text
-| rec_type_u8 |
+| tag_u8 | tag_payload |
+| tag_u8 | tag_payload |
+...
 ```
 
-Record types (v1):
+Tags (v1):
 
 - `1 = AddFile`
 - `2 = DeleteFile`
+- `3 = SetLogNumber`
+- `4 = SetLastSequence`
 
-### AddFile Payload
+### AddFile Tag Payload
 
 ```text
-| rec_type_u8 = 1 |
+| tag_u8 = 1 |
 | level_u32_le |
 | file_id_u64_le |
 | file_size_u64_le |
@@ -46,13 +50,39 @@ Record types (v1):
 
 - `smallest_key_bytes` and `largest_key_bytes` are internal keys.
 
-### DeleteFile Payload
+### DeleteFile Tag Payload
 
 ```text
-| rec_type_u8 = 2 |
+| tag_u8 = 2 |
 | level_u32_le |
 | file_id_u64_le |
 ```
+
+### SetLogNumber Tag Payload
+
+Defines the active WAL file id for recovery.
+
+```text
+| tag_u8 = 3 |
+| log_number_u64_le |
+```
+
+### SetLastSequence Tag Payload
+
+Defines the minimum sequence baseline after restart (next_seq = last_sequence + 1).
+
+```text
+| tag_u8 = 4 |
+| last_sequence_u64_le |
+```
+
+Atomicity requirement:
+
+- Any flush or compaction that installs new SST files MUST include:
+  - AddFile tags for outputs
+  - DeleteFile tags for inputs (if applicable)
+  - SetLastSequence reflecting the current `last_sequence`
+  - SetLogNumber if WAL rotation is part of the operation
 
 ## 5.4 CURRENT File
 
@@ -73,10 +103,11 @@ Update protocol (Sync::Yes):
 
 1. Read `CURRENT` → open active manifest.
 2. Replay manifest log into VersionSet; stop at first invalid record; truncate tail.
-3. Scan DB directory for WAL files newer than the latest checkpointed state; replay into MemTable(s).
+3. Open and replay the WAL file indicated by `log_number` into MemTable(s).
 4. Startup GC:
    - List all `.sst` files on disk.
    - Delete any SST not referenced by VersionSet.
+   - Delete any `.log` files with id less than `log_number`.
    - Delete any `*.tmp` artifacts.
 
 Correctness: Orphan SSTs must never affect visible state because they are not in Manifest.
