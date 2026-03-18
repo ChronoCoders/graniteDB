@@ -6,10 +6,17 @@ edition = "2024"
 [dependencies]
 crc32c = "0.6"
 thiserror = "2"
+loom = { version = "0.7", optional = true }
 
 [features]
 fuzzing = []
+loom = ["dep:loom"]
 
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
+criterion = "0.5"
+
+[[bench]]
+name = "db"
+harness = false

@@ -8,9 +8,12 @@ mod failpoint;
 mod fuzzing_support;
 mod internal_key;
 mod manifest;
+#[cfg(feature = "loom")]
+pub mod memdb;
 mod memtable;
 mod options;
 mod sstable;
+pub mod sync;
 mod util;
 mod wal;
 mod write_batch;
