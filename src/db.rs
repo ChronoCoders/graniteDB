@@ -319,6 +319,104 @@ impl DB {
         })
     }
 
+    pub fn create_checkpoint(&self, dest_dir: impl AsRef<Path>) -> Result<()> {
+        let dest_dir = dest_dir.as_ref();
+        fs::create_dir_all(dest_dir)?;
+        if fs::read_dir(dest_dir)?.next().is_some() {
+            return Err(GraniteError::InvalidArgument("checkpoint dir not empty"));
+        }
+
+        let mut w = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| GraniteError::Corrupt("poisoned"))?;
+        if let Some(e) = w.bg_error.take() {
+            return Err(e);
+        }
+
+        w.manifest.sync_force()?;
+        w.wal.sync_force()?;
+
+        let current_src = self.path.join("CURRENT");
+        let current_contents = fs::read_to_string(&current_src)
+            .map_err(|_| GraniteError::Corrupt("missing CURRENT"))?;
+        let manifest_name = current_contents.trim();
+        if manifest_name.is_empty() {
+            return Err(GraniteError::Corrupt("empty CURRENT"));
+        }
+        let manifest_src = self.path.join(manifest_name);
+
+        let mut sst_ids: Vec<u64> = Vec::new();
+        for level in &w.version.levels {
+            for meta in level {
+                sst_ids.push(meta.file_id);
+            }
+        }
+        let wal_ids = [w.wal_id, w.prev_wal_id];
+
+        fs::copy(&current_src, dest_dir.join("CURRENT"))?;
+        fs::copy(&manifest_src, dest_dir.join(manifest_name))?;
+        for file_id in sst_ids {
+            let name = sst_file_name(file_id);
+            hard_link_or_copy(&self.path.join(&name), &dest_dir.join(&name))?;
+        }
+        for file_id in wal_ids {
+            if file_id == 0 {
+                continue;
+            }
+            let name = wal_file_name(file_id);
+            fs::copy(self.path.join(&name), dest_dir.join(&name))?;
+        }
+        Ok(())
+    }
+
+    pub fn ingest_sst_files(&self, sst_paths: &[PathBuf], move_files: bool) -> Result<Vec<u64>> {
+        let mut w = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| GraniteError::Corrupt("poisoned"))?;
+        if let Some(e) = w.bg_error.take() {
+            return Err(e);
+        }
+
+        let mut out_ids: Vec<u64> = Vec::new();
+        for src_path in sst_paths {
+            let file_id = w.next_file_id;
+            w.next_file_id = w.next_file_id.saturating_add(1);
+            let dst_path = self.path.join(sst_file_name(file_id));
+
+            if move_files {
+                fs::rename(src_path, &dst_path)?;
+            } else {
+                hard_link_or_copy(src_path, &dst_path)?;
+            }
+
+            let (smallest_key, largest_key, max_seq) =
+                inspect_sstable(&dst_path, w.block_cache.clone())?;
+            let file_size = fs::metadata(&dst_path)?.len();
+            let meta = crate::sstable::FileMeta {
+                level: 0,
+                file_id,
+                file_size,
+                smallest_key,
+                largest_key,
+            };
+
+            w.version.levels[0].push(meta.clone());
+            w.version.last_sequence = w.version.last_sequence.max(max_seq);
+            w.next_seq = w.next_seq.max(max_seq.saturating_add(1));
+
+            let last_sequence = w.version.last_sequence;
+            w.manifest.append_ingest_edit(&meta, last_sequence)?;
+            out_ids.push(file_id);
+        }
+
+        self.shared.cv.notify_all();
+        Ok(out_ids)
+    }
+
     pub fn metrics(&self) -> Result<DbMetrics> {
         let w = self
             .shared
@@ -1058,6 +1156,35 @@ impl<'a> Transaction<'a> {
         self.db
             .commit_transaction(self.snapshot, self.reads, self.batch, self.write_options)
     }
+}
+
+fn hard_link_or_copy(src: &Path, dst: &Path) -> Result<()> {
+    match fs::hard_link(src, dst) {
+        Ok(_) => Ok(()),
+        Err(_) => {
+            fs::copy(src, dst)?;
+            Ok(())
+        }
+    }
+}
+
+fn inspect_sstable(path: &Path, cache: Arc<BlockCache>) -> Result<(Vec<u8>, Vec<u8>, u64)> {
+    let reader = TableReader::open_with_cache(path, Some(cache))?;
+    let mut scanner = reader.scanner();
+    let mut smallest: Option<Vec<u8>> = None;
+    let mut largest: Option<Vec<u8>> = None;
+    let mut max_seq: u64 = 0;
+    while let Some((k, _v)) = scanner.next_item()? {
+        if smallest.is_none() {
+            smallest = Some(k.clone());
+        }
+        largest = Some(k.clone());
+        let parsed = parse_internal_key(&k)?;
+        max_seq = max_seq.max(parsed.seq);
+    }
+    let smallest = smallest.ok_or(GraniteError::Corrupt("empty table"))?;
+    let largest = largest.ok_or(GraniteError::Corrupt("empty table"))?;
+    Ok((smallest, largest, max_seq))
 }
 
 fn wal_file_name(file_id: u64) -> String {

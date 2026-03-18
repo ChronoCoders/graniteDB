@@ -135,6 +135,13 @@ impl Wal {
         }
         Ok(())
     }
+
+    pub fn sync_force(&mut self) -> Result<()> {
+        failpoint::hit("wal:before_sync");
+        failpoint::sync_data("wal:sync", &self.file)?;
+        failpoint::hit("wal:after_sync");
+        Ok(())
+    }
 }
 
 fn recover_and_truncate(file: &mut File) -> Result<WalRecovery> {

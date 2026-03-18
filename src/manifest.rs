@@ -219,6 +219,23 @@ impl Manifest {
         Ok(())
     }
 
+    pub fn sync_force(&mut self) -> Result<()> {
+        failpoint::hit("manifest:before_sync");
+        failpoint::sync_data("manifest:sync", &self.file)?;
+        failpoint::hit("manifest:after_sync");
+        Ok(())
+    }
+
+    pub fn append_ingest_edit(&mut self, meta: &FileMeta, last_sequence: u64) -> Result<()> {
+        let mut payload = Vec::new();
+        encode_add_file(&mut payload, meta);
+        encode_set_last_sequence(&mut payload, last_sequence);
+        failpoint::hit("manifest:before_append");
+        self.append_logical_record(&payload)?;
+        failpoint::hit("manifest:after_append");
+        self.sync()
+    }
+
     fn checkpoint(&mut self, version: &VersionSet) -> Result<u64> {
         let old_name = self.manifest_name.clone();
         let old_path = self.db_dir.join(&old_name);
