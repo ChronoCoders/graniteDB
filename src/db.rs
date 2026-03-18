@@ -1895,15 +1895,28 @@ fn maybe_compact_levels(db_dir: &Path, w: &mut WriterState) -> Result<()> {
             continue;
         }
 
-        let mut did_any = false;
+        let mut best: Option<(usize, u64, u64)> = None;
         for level in 1..(max_levels - 1) {
-            if level_total_bytes(&w.version, level) > level_target_bytes(&w.options, level) {
-                compact_level_to_next(db_dir, w, level)?;
-                did_any = true;
-                break;
+            let bytes = level_total_bytes(&w.version, level);
+            let target = level_target_bytes(&w.options, level).max(1);
+            if bytes <= target {
+                continue;
+            }
+            match best {
+                None => best = Some((level, bytes, target)),
+                Some((_best_level, best_bytes, best_target)) => {
+                    if (bytes as u128).saturating_mul(best_target as u128)
+                        > (best_bytes as u128).saturating_mul(target as u128)
+                    {
+                        best = Some((level, bytes, target));
+                    }
+                }
             }
         }
-        if !did_any {
+        if let Some((level, _bytes, _target)) = best {
+            compact_level_to_next(db_dir, w, level)?;
+            continue;
+        } else {
             return Ok(());
         }
     }
