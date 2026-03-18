@@ -29,24 +29,28 @@ fn main() {
             memtable_max_bytes: 1,
             l0_slowdown_trigger: 1000,
             l0_stop_trigger: 2000,
+            ..Options::default()
         },
         "compaction" => Options {
             sync,
             memtable_max_bytes: 1,
             l0_slowdown_trigger: 1,
             l0_stop_trigger: 2,
+            ..Options::default()
         },
         "ioerr_flush" => Options {
             sync,
             memtable_max_bytes: 1,
             l0_slowdown_trigger: 1000,
             l0_stop_trigger: 2000,
+            ..Options::default()
         },
         "ioerr_compaction" => Options {
             sync,
             memtable_max_bytes: 1,
             l0_slowdown_trigger: 1,
             l0_stop_trigger: 2,
+            ..Options::default()
         },
         _ => Options {
             sync,

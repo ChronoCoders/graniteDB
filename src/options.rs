@@ -10,6 +10,9 @@ pub struct Options {
     pub memtable_max_bytes: usize,
     pub l0_slowdown_trigger: usize,
     pub l0_stop_trigger: usize,
+    pub max_levels: usize,
+    pub level1_target_bytes: u64,
+    pub level_multiplier: u64,
 }
 
 impl Default for Options {
@@ -19,6 +22,9 @@ impl Default for Options {
             memtable_max_bytes: 64 * 1024 * 1024,
             l0_slowdown_trigger: 8,
             l0_stop_trigger: 12,
+            max_levels: 4,
+            level1_target_bytes: 4 * 1024 * 1024,
+            level_multiplier: 10,
         }
     }
 }

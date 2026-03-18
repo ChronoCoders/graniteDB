@@ -29,6 +29,7 @@ fn flush_io_error_does_not_ack_or_persist_next_write() {
             memtable_max_bytes: 1,
             l0_slowdown_trigger: 1000,
             l0_stop_trigger: 2000,
+            ..Options::default()
         },
     )
     .unwrap();
@@ -64,6 +65,7 @@ fn compaction_io_error_does_not_ack_or_persist_next_write() {
             memtable_max_bytes: 1024 * 1024 * 1024,
             l0_slowdown_trigger: 0,
             l0_stop_trigger: 0,
+            ..Options::default()
         },
     )
     .unwrap();

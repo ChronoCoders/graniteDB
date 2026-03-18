@@ -46,6 +46,7 @@ proptest! {
             memtable_max_bytes: 1024 * 1024 * 1024,
             l0_slowdown_trigger: 8,
             l0_stop_trigger: 12,
+            ..Options::default()
         };
 
         let mut model: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
@@ -98,6 +99,7 @@ proptest! {
             memtable_max_bytes: 64,
             l0_slowdown_trigger: 2,
             l0_stop_trigger: 4,
+            ..Options::default()
         };
 
         let mut model: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();

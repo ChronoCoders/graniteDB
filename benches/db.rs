@@ -12,6 +12,7 @@ fn bench_put_get(c: &mut Criterion) {
                 memtable_max_bytes: 1024 * 1024,
                 l0_slowdown_trigger: 8,
                 l0_stop_trigger: 16,
+                ..Options::default()
             };
             let db = DB::open(&path, opts).unwrap();
             for i in 0..100u32 {

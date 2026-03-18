@@ -33,6 +33,11 @@ GraniteDB is production-grade when it meets:
 - Implement compaction selection and output placement for L0→L1 and Lk→L(k+1).
 - Add per-level size targets and compaction triggers.
 
+Status:
+
+- Implemented metadata support (Phase B).
+- Implemented synchronous multi-level compaction selection for L0→L1 and Lk→L(k+1) with configurable `max_levels`.
+
 ### Phase D — Background Work + Immutable MemTables
 
 - Add immutable memtable queue.

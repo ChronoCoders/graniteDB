@@ -70,7 +70,11 @@ impl DB {
         let path = path.as_ref().to_path_buf();
         fs::create_dir_all(&path)?;
 
-        let (manifest, version) = Manifest::open(&path, options.sync)?;
+        let (manifest, mut version) = Manifest::open(&path, options.sync)?;
+        let max_levels = options.max_levels.max(2);
+        if version.levels.len() < max_levels {
+            version.levels.resize_with(max_levels, Vec::new);
+        }
         startup_gc(&path, &version)?;
         let next_file_id = version.max_file_id().saturating_add(1).max(1);
 
@@ -132,9 +136,7 @@ impl DB {
         if w.memtable.approx_bytes() >= w.options.memtable_max_bytes {
             flush_memtable_to_l0(&self.path, &mut w)?;
         }
-        if w.version.levels[0].len() > w.options.l0_slowdown_trigger {
-            compact_l0_to_l1(&self.path, &mut w)?;
-        }
+        maybe_compact_levels(&self.path, &mut w)?;
 
         let record = encode_batch_as_wal_record(&batch);
         w.wal.append_logical_record(&record)?;
@@ -390,22 +392,8 @@ fn compact_l0_to_l1(db_dir: &Path, w: &mut WriterState) -> Result<()> {
     let min_user = min_user.ok_or(GraniteError::Corrupt("missing min user key"))?;
     let max_user = max_user.ok_or(GraniteError::Corrupt("missing max user key"))?;
 
-    let overlap_l1: Vec<crate::sstable::FileMeta> = w.version.levels[1]
-        .iter()
-        .filter(|m| {
-            let s = parse_internal_key(&m.smallest_key)
-                .map(|p| p.user_key.to_vec())
-                .ok();
-            let l = parse_internal_key(&m.largest_key)
-                .map(|p| p.user_key.to_vec())
-                .ok();
-            match (s, l) {
-                (Some(s), Some(l)) => !(l < min_user || s > max_user),
-                _ => false,
-            }
-        })
-        .cloned()
-        .collect();
+    let (overlap_l1, _min_user, _max_user) =
+        collect_overlaps_expanding(&w.version.levels[1], min_user, max_user)?;
 
     let file_id = w.next_file_id;
     w.next_file_id = w.next_file_id.saturating_add(1);
@@ -524,6 +512,226 @@ fn compact_l0_to_l1(db_dir: &Path, w: &mut WriterState) -> Result<()> {
         let _ = fs::remove_file(db_dir.join(sst_file_name(id)));
     }
     Ok(())
+}
+
+fn maybe_compact_levels(db_dir: &Path, w: &mut WriterState) -> Result<()> {
+    let max_levels = w.options.max_levels.max(2);
+    if w.version.levels.len() < max_levels {
+        w.version.levels.resize_with(max_levels, Vec::new);
+    }
+
+    let mut steps = 0usize;
+    let max_steps = max_levels.saturating_mul(4).max(8);
+    loop {
+        if steps >= max_steps {
+            return Ok(());
+        }
+        steps += 1;
+
+        if w.version.levels[0].len() > w.options.l0_slowdown_trigger {
+            compact_l0_to_l1(db_dir, w)?;
+            continue;
+        }
+
+        let mut did_any = false;
+        for level in 1..(max_levels - 1) {
+            if level_total_bytes(&w.version, level) > level_target_bytes(&w.options, level) {
+                compact_level_to_next(db_dir, w, level)?;
+                did_any = true;
+                break;
+            }
+        }
+        if !did_any {
+            return Ok(());
+        }
+    }
+}
+
+fn level_total_bytes(version: &VersionSet, level: usize) -> u64 {
+    version.levels[level].iter().map(|m| m.file_size).sum()
+}
+
+fn level_target_bytes(options: &Options, level: usize) -> u64 {
+    if level == 0 {
+        return u64::MAX;
+    }
+    let mut out = options.level1_target_bytes;
+    for _ in 1..level {
+        out = out.saturating_mul(options.level_multiplier.max(1));
+    }
+    out
+}
+
+fn compact_level_to_next(db_dir: &Path, w: &mut WriterState, level: usize) -> Result<()> {
+    let max_levels = w.options.max_levels.max(2);
+    if level + 1 >= max_levels {
+        return Ok(());
+    }
+    if w.version.levels[level].is_empty() {
+        return Ok(());
+    }
+
+    let input = w.version.levels[level][0].clone();
+    let (min_user, max_user) = meta_user_range(&input)?;
+    let (overlaps, _min_user, _max_user) =
+        collect_overlaps_expanding(&w.version.levels[level + 1], min_user, max_user)?;
+
+    let file_id = w.next_file_id;
+    w.next_file_id = w.next_file_id.saturating_add(1);
+    let tmp_path = db_dir.join(sst_temp_file_name(file_id));
+    let final_path = db_dir.join(sst_file_name(file_id));
+
+    struct Source {
+        scanner: crate::sstable::SstScanner,
+        current: Option<(Vec<u8>, Vec<u8>)>,
+    }
+
+    let mut sources: Vec<Source> = Vec::new();
+    for meta in std::iter::once(&input).chain(overlaps.iter()) {
+        let path = db_dir.join(sst_file_name(meta.file_id));
+        let reader = TableReader::open(path)?;
+        let mut scanner = reader.scanner();
+        let current = scanner.next_item()?;
+        sources.push(Source { scanner, current });
+    }
+
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
+    #[derive(Clone, Eq, PartialEq)]
+    struct HeapEntry {
+        key: Vec<u8>,
+        src: usize,
+        value: Vec<u8>,
+    }
+
+    impl Ord for HeapEntry {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            match cmp_internal_key_bytes_unchecked(&self.key, &other.key) {
+                std::cmp::Ordering::Equal => self.src.cmp(&other.src),
+                other => other,
+            }
+        }
+    }
+
+    impl PartialOrd for HeapEntry {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    type HeapItem = Reverse<HeapEntry>;
+    let mut heap: BinaryHeap<HeapItem> = BinaryHeap::new();
+    for (i, s) in sources.iter().enumerate() {
+        if let Some((k, v)) = &s.current {
+            heap.push(Reverse(HeapEntry {
+                key: k.clone(),
+                src: i,
+                value: v.clone(),
+            }));
+        }
+    }
+
+    let mut builder = TableBuilder::create(&tmp_path)?;
+    while let Some(Reverse(e)) = heap.pop() {
+        builder.add(&e.key, &e.value)?;
+        let src = e.src;
+        let next = sources[src].scanner.next_item()?;
+        sources[src].current = next;
+        if let Some((nk, nv)) = &sources[src].current {
+            heap.push(Reverse(HeapEntry {
+                key: nk.clone(),
+                src,
+                value: nv.clone(),
+            }));
+        }
+    }
+
+    failpoint::io_err("compaction:before_sst_finish")?;
+    failpoint::hit("compaction:before_sst_finish");
+    let mut out_meta = builder.finish(w.options.sync == SyncMode::Yes)?;
+    failpoint::io_err("compaction:after_sst_finish")?;
+    failpoint::hit("compaction:after_sst_finish");
+    out_meta.file_id = file_id;
+    out_meta.level = (level + 1) as u32;
+    drop(sources);
+
+    failpoint::io_err("compaction:before_sst_rename")?;
+    failpoint::hit("compaction:before_sst_rename");
+    fs::rename(&tmp_path, &final_path)?;
+    failpoint::io_err("compaction:after_sst_rename")?;
+    failpoint::hit("compaction:after_sst_rename");
+    if w.options.sync == SyncMode::Yes {
+        failpoint::io_err("compaction:before_dir_sync")?;
+        failpoint::hit("compaction:before_dir_sync");
+        sync_parent_dir(&final_path)?;
+        failpoint::io_err("compaction:after_dir_sync")?;
+        failpoint::hit("compaction:after_dir_sync");
+    }
+
+    let mut deletes: Vec<(u32, u64)> = Vec::new();
+    deletes.push((level as u32, input.file_id));
+    deletes.extend(overlaps.iter().map(|m| ((level + 1) as u32, m.file_id)));
+
+    let last_sequence = w.next_seq.saturating_sub(1);
+    failpoint::io_err("compaction:before_manifest_edit")?;
+    failpoint::hit("compaction:before_manifest_edit");
+    w.manifest
+        .append_compaction_edit(&out_meta, &deletes, last_sequence)?;
+    failpoint::io_err("compaction:after_manifest_edit")?;
+    failpoint::hit("compaction:after_manifest_edit");
+    w.version.last_sequence = w.version.last_sequence.max(last_sequence);
+
+    w.version.levels[level].retain(|m| m.file_id != input.file_id);
+    let overlap_ids: std::collections::BTreeSet<u64> = overlaps.iter().map(|m| m.file_id).collect();
+    w.version.levels[level + 1].retain(|m| !overlap_ids.contains(&m.file_id));
+    w.version.levels[level + 1].push(out_meta);
+
+    let _ = fs::remove_file(db_dir.join(sst_file_name(input.file_id)));
+    for id in overlap_ids {
+        let _ = fs::remove_file(db_dir.join(sst_file_name(id)));
+    }
+
+    Ok(())
+}
+
+fn meta_user_range(meta: &crate::sstable::FileMeta) -> Result<(Vec<u8>, Vec<u8>)> {
+    let smallest = parse_internal_key(&meta.smallest_key)?.user_key.to_vec();
+    let largest = parse_internal_key(&meta.largest_key)?.user_key.to_vec();
+    Ok((smallest, largest))
+}
+
+fn collect_overlaps_expanding(
+    candidates: &[crate::sstable::FileMeta],
+    mut min_user: Vec<u8>,
+    mut max_user: Vec<u8>,
+) -> Result<(Vec<crate::sstable::FileMeta>, Vec<u8>, Vec<u8>)> {
+    let mut picked: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    loop {
+        let mut changed = false;
+        for m in candidates {
+            if picked.contains(&m.file_id) {
+                continue;
+            }
+            let (s, l) = meta_user_range(m)?;
+            if l < min_user || s > max_user {
+                continue;
+            }
+            min_user = min_user.min(s);
+            max_user = max_user.max(l);
+            picked.insert(m.file_id);
+            changed = true;
+        }
+        if !changed {
+            break;
+        }
+    }
+    let out: Vec<crate::sstable::FileMeta> = candidates
+        .iter()
+        .filter(|m| picked.contains(&m.file_id))
+        .cloned()
+        .collect();
+    Ok((out, min_user, max_user))
 }
 
 fn collect_visible_items(
@@ -778,6 +986,7 @@ mod tests {
             memtable_max_bytes: 1,
             l0_slowdown_trigger: 0,
             l0_stop_trigger: 0,
+            ..Options::default()
         };
 
         {
@@ -811,5 +1020,33 @@ mod tests {
             }
         }
         assert_eq!(sst_count, 1);
+    }
+
+    #[test]
+    fn multi_level_compaction_can_push_l1_into_l2() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("db");
+        let opts = Options {
+            sync: SyncMode::No,
+            memtable_max_bytes: 1,
+            l0_slowdown_trigger: 0,
+            l0_stop_trigger: 0,
+            max_levels: 3,
+            level1_target_bytes: 1,
+            level_multiplier: 1,
+        };
+
+        let db = DB::open(&path, opts).unwrap();
+        db.put(b"a", b"1").unwrap();
+        db.put(b"b", b"2").unwrap();
+
+        {
+            let w = db.writer.lock().unwrap();
+            assert!(w.version.levels.len() >= 3);
+            assert!(w.version.levels[0].is_empty());
+            assert!(w.version.levels[1].is_empty());
+            assert_eq!(w.version.levels[2].len(), 1);
+        }
+        db.close().unwrap();
     }
 }
