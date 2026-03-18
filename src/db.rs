@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
@@ -22,6 +22,12 @@ use crate::write_batch::{WriteBatch, WriteOp};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Snapshot {
     pub read_seq: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ColumnFamily {
+    pub id: u32,
+    pub name: String,
 }
 
 #[derive(Clone, Debug)]
@@ -103,6 +109,8 @@ struct WriterState {
     shutting_down: bool,
     bg_error: Option<GraniteError>,
     block_cache: Arc<BlockCache>,
+    column_families: HashMap<String, u32>,
+    next_cf_id: u32,
     metrics: DbMetrics,
     events: VecDeque<DbEvent>,
     options: Options,
@@ -153,6 +161,19 @@ impl DB {
         if version.levels.len() < max_levels {
             version.levels.resize_with(max_levels, Vec::new);
         }
+
+        let mut column_families: HashMap<String, u32> = HashMap::new();
+        let mut max_cf_id: u32 = 0;
+        for (id, name) in &version.column_families {
+            column_families.insert(name.clone(), *id);
+            max_cf_id = max_cf_id.max(*id);
+        }
+        if !column_families.contains_key("default") {
+            column_families.insert("default".to_string(), 0);
+            version.column_families.push((0u32, "default".to_string()));
+        }
+        let next_cf_id = max_cf_id.saturating_add(1);
+
         startup_gc(&path, &version)?;
         let next_file_id = version.max_file_id().saturating_add(1).max(1);
 
@@ -199,6 +220,8 @@ impl DB {
                 shutting_down: false,
                 bg_error: None,
                 block_cache,
+                column_families,
+                next_cf_id,
                 metrics: DbMetrics::default(),
                 events: VecDeque::new(),
                 options,
@@ -272,17 +295,7 @@ impl DB {
         Ok(w.events.iter().cloned().collect())
     }
 
-    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        let batch = WriteBatch::default().put(key.to_vec(), value.to_vec());
-        self.write_batch(batch)
-    }
-
-    pub fn delete(&self, key: &[u8]) -> Result<()> {
-        let batch = WriteBatch::default().delete(key.to_vec());
-        self.write_batch(batch)
-    }
-
-    pub fn write_batch(&self, batch: WriteBatch) -> Result<()> {
+    pub fn create_column_family(&self, name: &str) -> Result<ColumnFamily> {
         let mut w = self
             .shared
             .state
@@ -292,6 +305,97 @@ impl DB {
         if let Some(e) = w.bg_error.take() {
             return Err(e);
         }
+
+        if let Some(id) = w.column_families.get(name) {
+            return Ok(ColumnFamily {
+                id: *id,
+                name: name.to_string(),
+            });
+        }
+
+        let id = w.next_cf_id;
+        w.next_cf_id = w.next_cf_id.saturating_add(1);
+        w.manifest.append_create_column_family_edit(id, name)?;
+        w.version.column_families.push((id, name.to_string()));
+        w.column_families.insert(name.to_string(), id);
+        Ok(ColumnFamily {
+            id,
+            name: name.to_string(),
+        })
+    }
+
+    pub fn column_family(&self, name: &str) -> Result<Option<ColumnFamily>> {
+        let w = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| GraniteError::Corrupt("poisoned"))?;
+        Ok(w.column_families.get(name).copied().map(|id| ColumnFamily {
+            id,
+            name: name.to_string(),
+        }))
+    }
+
+    pub fn list_column_families(&self) -> Result<Vec<ColumnFamily>> {
+        let w = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| GraniteError::Corrupt("poisoned"))?;
+        let mut out: Vec<ColumnFamily> = w
+            .column_families
+            .iter()
+            .map(|(name, id)| ColumnFamily {
+                id: *id,
+                name: name.clone(),
+            })
+            .collect();
+        out.sort_by(|a, b| a.id.cmp(&b.id).then_with(|| a.name.cmp(&b.name)));
+        Ok(out)
+    }
+
+    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.put_cf_id(0, key, value)
+    }
+
+    pub fn put_cf(&self, cf: &ColumnFamily, key: &[u8], value: &[u8]) -> Result<()> {
+        self.put_cf_id(cf.id, key, value)
+    }
+
+    pub fn delete(&self, key: &[u8]) -> Result<()> {
+        self.delete_cf_id(0, key)
+    }
+
+    pub fn delete_cf(&self, cf: &ColumnFamily, key: &[u8]) -> Result<()> {
+        self.delete_cf_id(cf.id, key)
+    }
+
+    pub fn write_batch(&self, batch: WriteBatch) -> Result<()> {
+        self.write_batch_in_cf(0, batch)
+    }
+
+    fn put_cf_id(&self, cf_id: u32, key: &[u8], value: &[u8]) -> Result<()> {
+        let batch = WriteBatch::default().put(key.to_vec(), value.to_vec());
+        self.write_batch_in_cf(cf_id, batch)
+    }
+
+    fn delete_cf_id(&self, cf_id: u32, key: &[u8]) -> Result<()> {
+        let batch = WriteBatch::default().delete(key.to_vec());
+        self.write_batch_in_cf(cf_id, batch)
+    }
+
+    fn write_batch_in_cf(&self, cf_id: u32, batch: WriteBatch) -> Result<()> {
+        let mut w = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| GraniteError::Corrupt("poisoned"))?;
+
+        if let Some(e) = w.bg_error.take() {
+            return Err(e);
+        }
+
+        let batch = prefix_write_batch(cf_id, batch);
 
         let op_index = w.next_op_index;
         w.next_op_index = w.next_op_index.saturating_add(1);
@@ -412,21 +516,44 @@ impl DB {
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.get_with_snapshot(key, Snapshot { read_seq: u64::MAX })
+        self.get_cf_with_snapshot_id(0, key, Snapshot { read_seq: u64::MAX })
+    }
+
+    pub fn get_cf(&self, cf: &ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.get_cf_with_snapshot_id(cf.id, key, Snapshot { read_seq: u64::MAX })
     }
 
     pub fn get_with_snapshot(&self, key: &[u8], snapshot: Snapshot) -> Result<Option<Vec<u8>>> {
+        self.get_cf_with_snapshot_id(0, key, snapshot)
+    }
+
+    pub fn get_cf_with_snapshot(
+        &self,
+        cf: &ColumnFamily,
+        key: &[u8],
+        snapshot: Snapshot,
+    ) -> Result<Option<Vec<u8>>> {
+        self.get_cf_with_snapshot_id(cf.id, key, snapshot)
+    }
+
+    fn get_cf_with_snapshot_id(
+        &self,
+        cf_id: u32,
+        key: &[u8],
+        snapshot: Snapshot,
+    ) -> Result<Option<Vec<u8>>> {
         let w = self
             .shared
             .state
             .lock()
             .map_err(|_| GraniteError::Corrupt("poisoned"))?;
-        match w.memtable.get(key, snapshot.read_seq)? {
+        let key = encode_cf_user_key(cf_id, key);
+        match w.memtable.get(&key, snapshot.read_seq)? {
             Some(GetDecision::Value(v)) => Ok(Some(v)),
             Some(GetDecision::Deleted) => Ok(None),
             None => {
                 if let Some(imm) = w.imm_memtable.as_ref() {
-                    match imm.get(key, snapshot.read_seq)? {
+                    match imm.get(&key, snapshot.read_seq)? {
                         Some(GetDecision::Value(v)) => return Ok(Some(v)),
                         Some(GetDecision::Deleted) => return Ok(None),
                         None => {}
@@ -436,15 +563,17 @@ impl DB {
                     let path = self.path.join(sst_file_name(meta.file_id));
                     let mut reader =
                         TableReader::open_with_cache(path, Some(w.block_cache.clone()))?;
-                    let seek = encode_internal_key(key, snapshot.read_seq, ValueType::Tombstone);
-                    let got =
-                        reader.get_by_seek_key_prefix(&seek, key, snapshot.read_seq, |vt, v| {
-                            match vt {
-                                0 => Some(GetDecision::Deleted),
-                                1 => Some(GetDecision::Value(v.to_vec())),
-                                _ => None,
-                            }
-                        })?;
+                    let seek = encode_internal_key(&key, snapshot.read_seq, ValueType::Tombstone);
+                    let got = reader.get_by_seek_key_prefix(
+                        &seek,
+                        &key,
+                        snapshot.read_seq,
+                        |vt, v| match vt {
+                            0 => Some(GetDecision::Deleted),
+                            1 => Some(GetDecision::Value(v.to_vec())),
+                            _ => None,
+                        },
+                    )?;
                     match got {
                         Some(GetDecision::Value(v)) => return Ok(Some(v)),
                         Some(GetDecision::Deleted) => return Ok(None),
@@ -453,17 +582,17 @@ impl DB {
                 }
                 for level in w.version.levels.iter().skip(1) {
                     for meta in level {
-                        if !meta_may_contain_user_key(meta, key)? {
+                        if !meta_may_contain_user_key(meta, &key)? {
                             continue;
                         }
                         let path = self.path.join(sst_file_name(meta.file_id));
                         let mut reader =
                             TableReader::open_with_cache(path, Some(w.block_cache.clone()))?;
                         let seek =
-                            encode_internal_key(key, snapshot.read_seq, ValueType::Tombstone);
+                            encode_internal_key(&key, snapshot.read_seq, ValueType::Tombstone);
                         let got = reader.get_by_seek_key_prefix(
                             &seek,
-                            key,
+                            &key,
                             snapshot.read_seq,
                             |vt, v| match vt {
                                 0 => Some(GetDecision::Deleted),
@@ -484,17 +613,39 @@ impl DB {
     }
 
     pub fn iter(&self, range: Range) -> Result<DbIterator> {
-        self.iter_with_snapshot(range, Snapshot { read_seq: u64::MAX })
+        self.iter_cf_with_snapshot_id(0, range, Snapshot { read_seq: u64::MAX })
     }
 
     pub fn iter_with_snapshot(&self, range: Range, snapshot: Snapshot) -> Result<DbIterator> {
+        self.iter_cf_with_snapshot_id(0, range, snapshot)
+    }
+
+    pub fn iter_cf(&self, cf: &ColumnFamily, range: Range) -> Result<DbIterator> {
+        self.iter_cf_with_snapshot_id(cf.id, range, Snapshot { read_seq: u64::MAX })
+    }
+
+    pub fn iter_cf_with_snapshot(
+        &self,
+        cf: &ColumnFamily,
+        range: Range,
+        snapshot: Snapshot,
+    ) -> Result<DbIterator> {
+        self.iter_cf_with_snapshot_id(cf.id, range, snapshot)
+    }
+
+    fn iter_cf_with_snapshot_id(
+        &self,
+        cf_id: u32,
+        range: Range,
+        snapshot: Snapshot,
+    ) -> Result<DbIterator> {
         let w = self
             .shared
             .state
             .lock()
             .map_err(|_| GraniteError::Corrupt("poisoned"))?;
 
-        let out = collect_visible_items(&self.path, &w, &range, snapshot)?;
+        let out = collect_visible_items(&self.path, &w, cf_id, &range, snapshot)?;
 
         Ok(DbIterator {
             items: out.into_iter(),
@@ -1147,6 +1298,7 @@ fn collect_overlaps_expanding(
 fn collect_visible_items(
     db_dir: &Path,
     w: &WriterState,
+    cf_id: u32,
     range: &Range,
     snapshot: Snapshot,
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
@@ -1190,12 +1342,13 @@ fn collect_visible_items(
             let path = db_dir.join(sst_file_name(meta.file_id));
             let reader = TableReader::open_with_cache(path, Some(w.block_cache.clone()))?;
             let mut it = reader.scanner();
-            if let Some(seek) = range_start_seek_internal_key(range) {
-                it.seek(&seek)?;
-            }
+            let Some(seek) = range_start_seek_internal_key_for_cf(cf_id, range) else {
+                return Ok(Vec::new());
+            };
+            it.seek(&seek)?;
             let mut items = Vec::new();
             while let Some((k, v)) = it.next_item()? {
-                if user_key_past_end(&k, range)? {
+                if internal_key_past_end_for_cf(&k, cf_id, range)? {
                     break;
                 }
                 items.push((k, v));
@@ -1255,19 +1408,28 @@ fn collect_visible_items(
         if parsed.seq > snapshot.read_seq {
             continue;
         }
-        if !user_key_in_range(parsed.user_key, range) {
+        let Ok((entry_cf_id, user_key)) = split_cf_user_key(parsed.user_key) else {
+            continue;
+        };
+        if entry_cf_id != cf_id {
+            if entry_cf_id > cf_id {
+                break;
+            }
+            continue;
+        }
+        if !user_key_in_range(user_key, range) {
             continue;
         }
         if last_user_key
             .as_ref()
-            .is_some_and(|prev| prev.as_slice() == parsed.user_key)
+            .is_some_and(|prev| prev.as_slice() == user_key)
         {
             continue;
         }
-        last_user_key = Some(parsed.user_key.to_vec());
+        last_user_key = Some(user_key.to_vec());
 
         match parsed.value_type {
-            ValueType::Value => out.push((parsed.user_key.to_vec(), e.value)),
+            ValueType::Value => out.push((user_key.to_vec(), e.value)),
             ValueType::Tombstone => {}
         }
     }
@@ -1289,21 +1451,80 @@ fn user_key_in_range(user_key: &[u8], range: &Range) -> bool {
     true
 }
 
-fn range_start_seek_internal_key(range: &Range) -> Option<Vec<u8>> {
-    match &range.start {
-        Bound::Unbounded => None,
-        Bound::Included(k) => Some(encode_internal_key(k, u64::MAX, ValueType::Tombstone)),
-        Bound::Excluded(k) => Some(encode_internal_key(k, 0, ValueType::Value)),
+fn range_start_seek_internal_key_for_cf(cf_id: u32, range: &Range) -> Option<Vec<u8>> {
+    let start_user_key = match &range.start {
+        Bound::Unbounded => Some(cf_id.to_be_bytes().to_vec()),
+        Bound::Included(k) => Some(encode_cf_user_key(cf_id, k)),
+        Bound::Excluded(k) => successor_key(encode_cf_user_key(cf_id, k)),
+    }?;
+    Some(encode_internal_key(
+        &start_user_key,
+        u64::MAX,
+        ValueType::Tombstone,
+    ))
+}
+
+fn successor_key(mut key: Vec<u8>) -> Option<Vec<u8>> {
+    for i in (0..key.len()).rev() {
+        if key[i] != u8::MAX {
+            key[i] = key[i].wrapping_add(1);
+            key.truncate(i + 1);
+            return Some(key);
+        }
+    }
+    None
+}
+
+fn internal_key_past_end_for_cf(internal_key: &[u8], cf_id: u32, range: &Range) -> Result<bool> {
+    let parsed = parse_internal_key(internal_key)?;
+    let (entry_cf_id, user_key) = split_cf_user_key(parsed.user_key)?;
+    if entry_cf_id > cf_id {
+        return Ok(true);
+    }
+    if entry_cf_id < cf_id {
+        return Ok(false);
+    }
+    match &range.end {
+        Bound::Unbounded => Ok(false),
+        Bound::Included(k) => Ok(user_key > k.as_slice()),
+        Bound::Excluded(k) => Ok(user_key >= k.as_slice()),
     }
 }
 
-fn user_key_past_end(internal_key: &[u8], range: &Range) -> Result<bool> {
-    let parsed = parse_internal_key(internal_key)?;
-    match &range.end {
-        Bound::Unbounded => Ok(false),
-        Bound::Included(k) => Ok(parsed.user_key > k.as_slice()),
-        Bound::Excluded(k) => Ok(parsed.user_key >= k.as_slice()),
+fn encode_cf_user_key(cf_id: u32, user_key: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + user_key.len());
+    out.extend_from_slice(&cf_id.to_be_bytes());
+    out.extend_from_slice(user_key);
+    out
+}
+
+fn split_cf_user_key(user_key: &[u8]) -> Result<(u32, &[u8])> {
+    if user_key.len() < 4 {
+        return Err(GraniteError::Corrupt("missing cf prefix"));
     }
+    let cf_id = u32::from_be_bytes(
+        user_key[..4]
+            .try_into()
+            .map_err(|_| GraniteError::Corrupt("cf id bytes"))?,
+    );
+    Ok((cf_id, &user_key[4..]))
+}
+
+fn prefix_write_batch(cf_id: u32, batch: WriteBatch) -> WriteBatch {
+    let ops = batch
+        .ops
+        .into_iter()
+        .map(|op| match op {
+            WriteOp::Put { key, value } => WriteOp::Put {
+                key: encode_cf_user_key(cf_id, &key),
+                value,
+            },
+            WriteOp::Delete { key } => WriteOp::Delete {
+                key: encode_cf_user_key(cf_id, &key),
+            },
+        })
+        .collect();
+    WriteBatch { ops }
 }
 
 fn encode_batch_as_wal_record(batch: &WriteBatch, start_seq: u64) -> Vec<u8> {

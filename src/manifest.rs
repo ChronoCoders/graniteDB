@@ -37,6 +37,7 @@ const TAG_DELETE_FILE: u8 = 2;
 const TAG_SET_LOG_NUMBER: u8 = 3;
 const TAG_SET_LAST_SEQUENCE: u8 = 4;
 const TAG_SET_PREV_LOG_NUMBER: u8 = 5;
+const TAG_ADD_COLUMN_FAMILY: u8 = 6;
 
 #[derive(Clone, Debug)]
 pub struct VersionSet {
@@ -44,6 +45,7 @@ pub struct VersionSet {
     pub log_number: u64,
     pub prev_log_number: u64,
     pub last_sequence: u64,
+    pub column_families: Vec<(u32, String)>,
 }
 
 impl VersionSet {
@@ -68,6 +70,7 @@ impl Default for VersionSet {
             log_number: 1,
             prev_log_number: 0,
             last_sequence: 0,
+            column_families: vec![(0, "default".to_string())],
         }
     }
 }
@@ -182,6 +185,15 @@ impl Manifest {
         self.sync()
     }
 
+    pub fn append_create_column_family_edit(&mut self, id: u32, name: &str) -> Result<()> {
+        let mut payload = Vec::new();
+        encode_add_column_family(&mut payload, id, name);
+        failpoint::hit("manifest:before_append");
+        self.append_logical_record(&payload)?;
+        failpoint::hit("manifest:after_append");
+        self.sync()
+    }
+
     pub fn maybe_checkpoint(
         &mut self,
         version: &VersionSet,
@@ -260,6 +272,9 @@ fn parse_manifest_number(name: &str) -> Result<u64> {
 
 fn encode_snapshot(version: &VersionSet) -> Vec<u8> {
     let mut payload = Vec::new();
+    for (id, name) in &version.column_families {
+        encode_add_column_family(&mut payload, *id, name);
+    }
     for level in &version.levels {
         for meta in level {
             encode_add_file(&mut payload, meta);
@@ -269,6 +284,13 @@ fn encode_snapshot(version: &VersionSet) -> Vec<u8> {
     encode_set_prev_log_number(&mut payload, version.prev_log_number);
     encode_set_last_sequence(&mut payload, version.last_sequence);
     payload
+}
+
+fn encode_add_column_family(out: &mut Vec<u8>, id: u32, name: &str) {
+    out.push(TAG_ADD_COLUMN_FAMILY);
+    out.extend_from_slice(&id.to_le_bytes());
+    out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    out.extend_from_slice(name.as_bytes());
 }
 
 fn append_logical_record_to(
@@ -375,6 +397,14 @@ fn apply_one_record(version: &mut VersionSet, mut rec: &[u8]) -> Result<()> {
             TAG_SET_LAST_SEQUENCE => {
                 let last_sequence = read_u64(&mut rec)?;
                 version.last_sequence = version.last_sequence.max(last_sequence);
+            }
+            TAG_ADD_COLUMN_FAMILY => {
+                let id = read_u32(&mut rec)?;
+                let name_bytes = read_bytes(&mut rec)?;
+                let name = String::from_utf8(name_bytes)
+                    .map_err(|_| GraniteError::Corrupt("bad column family name"))?;
+                version.column_families.retain(|(cur_id, _)| *cur_id != id);
+                version.column_families.push((id, name));
             }
             _ => return Err(GraniteError::Corrupt("unknown manifest tag")),
         }

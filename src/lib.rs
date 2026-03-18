@@ -19,7 +19,7 @@ mod wal;
 mod write_batch;
 
 pub use crate::db::{
-    DB, DbEvent, DbEventKind, DbIterator, DbMetrics, DbStallReason, Range, Snapshot,
+    ColumnFamily, DB, DbEvent, DbEventKind, DbIterator, DbMetrics, DbStallReason, Range, Snapshot,
 };
 pub use crate::error::{GraniteError, Result};
 pub use crate::options::{Options, SyncMode};
