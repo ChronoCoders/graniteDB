@@ -388,6 +388,22 @@ impl DB {
         self.delete_cf_id(cf.id, key)
     }
 
+    pub fn delete_range(&self, range: Range) -> Result<()> {
+        self.delete_range_cf_id(0, range)
+    }
+
+    pub fn delete_range_cf(&self, cf: &ColumnFamily, range: Range) -> Result<()> {
+        self.delete_range_cf_id(cf.id, range)
+    }
+
+    pub fn merge(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.merge_cf_id(0, key, value)
+    }
+
+    pub fn merge_cf(&self, cf: &ColumnFamily, key: &[u8], value: &[u8]) -> Result<()> {
+        self.merge_cf_id(cf.id, key, value)
+    }
+
     pub fn write_batch(&self, batch: WriteBatch) -> Result<()> {
         self.write_batch_with_options(batch, WriteOptions::default())
     }
@@ -408,6 +424,26 @@ impl DB {
     fn delete_cf_id(&self, cf_id: u32, key: &[u8]) -> Result<()> {
         let batch = WriteBatch::default().delete_cf(cf_id, key.to_vec());
         self.write_batch_in_cf(cf_id, batch)
+    }
+
+    fn delete_range_cf_id(&self, cf_id: u32, range: Range) -> Result<()> {
+        let snapshot = self.snapshot()?;
+        let keys: Vec<Vec<u8>> = self
+            .iter_cf_with_snapshot_id(cf_id, range, snapshot)?
+            .map(|(k, _v)| k)
+            .collect();
+        let mut batch = WriteBatch::default();
+        for k in keys {
+            batch = batch.delete_cf(cf_id, k);
+        }
+        self.write_batch_with_options(batch, WriteOptions::default())
+    }
+
+    fn merge_cf_id(&self, cf_id: u32, key: &[u8], value: &[u8]) -> Result<()> {
+        let existing = self.get_cf_with_snapshot_id(cf_id, key, Snapshot { read_seq: u64::MAX })?;
+        let mut merged = existing.unwrap_or_default();
+        merged.extend_from_slice(value);
+        self.put_cf_id(cf_id, key, &merged)
     }
 
     fn write_batch_in_cf(&self, cf_id: u32, batch: WriteBatch) -> Result<()> {
@@ -1721,6 +1757,54 @@ mod tests {
         )
         .unwrap();
         db3.close().unwrap();
+    }
+
+    #[test]
+    fn merge_appends_value() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("db");
+        let db = DB::open(
+            &path,
+            Options {
+                sync: SyncMode::No,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        db.put(b"k", b"v1").unwrap();
+        db.merge(b"k", b"v2").unwrap();
+        assert_eq!(db.get(b"k").unwrap(), Some(b"v1v2".to_vec()));
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn delete_range_deletes_keys_in_range() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("db");
+        let db = DB::open(
+            &path,
+            Options {
+                sync: SyncMode::No,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        db.put(b"a", b"1").unwrap();
+        db.put(b"b", b"2").unwrap();
+        db.put(b"c", b"3").unwrap();
+
+        db.delete_range(Range {
+            start: Bound::Included(b"b".to_vec()),
+            end: Bound::Excluded(b"c".to_vec()),
+        })
+        .unwrap();
+
+        assert_eq!(db.get(b"a").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(db.get(b"b").unwrap(), None);
+        assert_eq!(db.get(b"c").unwrap(), Some(b"3".to_vec()));
+        db.close().unwrap();
     }
 
     #[test]
