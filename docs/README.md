@@ -19,6 +19,7 @@ This directory specifies GraniteDB’s correctness contract, on-disk formats, cr
 13. `13-sanitizers.md`
 14. `14-loom.md`
 15. `15-benchmarking.md`
+16. `16-ci.md`
 
 ## Non-Negotiables
 
