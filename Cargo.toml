@@ -1,0 +1,15 @@
+[package]
+name = "granitedb"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crc32c = "0.6"
+thiserror = "2"
+
+[features]
+fuzzing = []
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"

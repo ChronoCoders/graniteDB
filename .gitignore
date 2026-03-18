@@ -1,0 +1,9 @@
+/target
+/target_*/
+/target*/
+
+.DS_Store
+
+*.log
+*.tmp
+*.proptest-regressions

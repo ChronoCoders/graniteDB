@@ -1,0 +1,30 @@
+[package]
+name = "granitedb-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+granitedb = { path = "..", features = ["fuzzing"] }
+
+[[bin]]
+name = "fuzz_wal"
+path = "fuzz_targets/fuzz_wal.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_sstable"
+path = "fuzz_targets/fuzz_sstable.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_manifest"
+path = "fuzz_targets/fuzz_manifest.rs"
+test = false
+doc = false

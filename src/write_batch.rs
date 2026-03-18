@@ -1,0 +1,120 @@
+use crate::error::{GraniteError, Result};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WriteOp {
+    Put { key: Vec<u8>, value: Vec<u8> },
+    Delete { key: Vec<u8> },
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct WriteBatch {
+    pub ops: Vec<WriteOp>,
+}
+
+impl WriteBatch {
+    pub fn put(mut self, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> Self {
+        self.ops.push(WriteOp::Put {
+            key: key.into(),
+            value: value.into(),
+        });
+        self
+    }
+
+    pub fn delete(mut self, key: impl Into<Vec<u8>>) -> Self {
+        self.ops.push(WriteOp::Delete { key: key.into() });
+        self
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(self.ops.len() as u32).to_le_bytes());
+        for op in &self.ops {
+            match op {
+                WriteOp::Put { key, value } => {
+                    out.push(1u8);
+                    out.extend_from_slice(&(key.len() as u32).to_le_bytes());
+                    out.extend_from_slice(key);
+                    out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+                    out.extend_from_slice(value);
+                }
+                WriteOp::Delete { key } => {
+                    out.push(2u8);
+                    out.extend_from_slice(&(key.len() as u32).to_le_bytes());
+                    out.extend_from_slice(key);
+                }
+            }
+        }
+        out
+    }
+
+    pub fn decode(mut bytes: &[u8]) -> Result<Self> {
+        let count = read_u32(&mut bytes)? as usize;
+        let mut ops = Vec::with_capacity(count);
+        for _ in 0..count {
+            let op_type = read_u8(&mut bytes)?;
+            match op_type {
+                1 => {
+                    let key = read_bytes(&mut bytes)?;
+                    let value = read_bytes(&mut bytes)?;
+                    ops.push(WriteOp::Put { key, value });
+                }
+                2 => {
+                    let key = read_bytes(&mut bytes)?;
+                    ops.push(WriteOp::Delete { key });
+                }
+                _ => return Err(GraniteError::Corrupt("unknown op type")),
+            }
+        }
+        if !bytes.is_empty() {
+            return Err(GraniteError::Corrupt("trailing bytes in write batch"));
+        }
+        Ok(Self { ops })
+    }
+}
+
+fn read_u8(bytes: &mut &[u8]) -> Result<u8> {
+    if bytes.is_empty() {
+        return Err(GraniteError::Corrupt("unexpected eof"));
+    }
+    let v = bytes[0];
+    *bytes = &bytes[1..];
+    Ok(v)
+}
+
+fn read_u32(bytes: &mut &[u8]) -> Result<u32> {
+    if bytes.len() < 4 {
+        return Err(GraniteError::Corrupt("unexpected eof"));
+    }
+    let v = u32::from_le_bytes(
+        bytes[..4]
+            .try_into()
+            .map_err(|_| GraniteError::Corrupt("u32"))?,
+    );
+    *bytes = &bytes[4..];
+    Ok(v)
+}
+
+fn read_bytes(bytes: &mut &[u8]) -> Result<Vec<u8>> {
+    let len = read_u32(bytes)? as usize;
+    if bytes.len() < len {
+        return Err(GraniteError::Corrupt("unexpected eof"));
+    }
+    let out = bytes[..len].to_vec();
+    *bytes = &bytes[len..];
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_roundtrip() {
+        let batch = WriteBatch::default()
+            .put(b"a".to_vec(), b"1".to_vec())
+            .delete(b"b".to_vec());
+        let enc = batch.encode();
+        let dec = WriteBatch::decode(&enc).unwrap();
+        assert_eq!(batch, dec);
+    }
+}
