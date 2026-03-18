@@ -13,6 +13,8 @@ pub struct Options {
     pub max_levels: usize,
     pub level1_target_bytes: u64,
     pub level_multiplier: u64,
+    pub bloom_bits_per_key: u8,
+    pub block_cache_capacity_bytes: usize,
 }
 
 impl Default for Options {
@@ -25,6 +27,8 @@ impl Default for Options {
             max_levels: 4,
             level1_target_bytes: 4 * 1024 * 1024,
             level_multiplier: 10,
+            bloom_bits_per_key: 10,
+            block_cache_capacity_bytes: 64 * 1024 * 1024,
         }
     }
 }

@@ -12,7 +12,7 @@ use crate::internal_key::{
 use crate::manifest::{Manifest, VersionSet};
 use crate::memtable::{GetDecision, MemTable};
 use crate::options::{Options, SyncMode};
-use crate::sstable::{TableBuilder, TableReader};
+use crate::sstable::{BlockCache, TableBuilder, TableReader};
 use crate::util::sync_parent_dir;
 use crate::wal::Wal;
 use crate::write_batch::{WriteBatch, WriteOp};
@@ -64,6 +64,7 @@ struct WriterState {
     imm_trigger_op_index: u64,
     shutting_down: bool,
     bg_error: Option<GraniteError>,
+    block_cache: Arc<BlockCache>,
     options: Options,
 }
 
@@ -83,6 +84,7 @@ impl DB {
         let path = path.as_ref().to_path_buf();
         fs::create_dir_all(&path)?;
 
+        let block_cache = Arc::new(BlockCache::new(options.block_cache_capacity_bytes));
         let (manifest, mut version) = Manifest::open(&path, options.sync)?;
         let max_levels = options.max_levels.max(2);
         if version.levels.len() < max_levels {
@@ -133,6 +135,7 @@ impl DB {
                 imm_trigger_op_index: 0,
                 shutting_down: false,
                 bg_error: None,
+                block_cache,
                 options,
             }),
             cv: Condvar::new(),
@@ -320,7 +323,8 @@ impl DB {
                 }
                 for meta in w.version.levels[0].iter().rev() {
                     let path = self.path.join(sst_file_name(meta.file_id));
-                    let mut reader = TableReader::open(path)?;
+                    let mut reader =
+                        TableReader::open_with_cache(path, Some(w.block_cache.clone()))?;
                     let seek = encode_internal_key(key, snapshot.read_seq, ValueType::Tombstone);
                     let got =
                         reader.get_by_seek_key_prefix(&seek, key, snapshot.read_seq, |vt, v| {
@@ -342,7 +346,8 @@ impl DB {
                             continue;
                         }
                         let path = self.path.join(sst_file_name(meta.file_id));
-                        let mut reader = TableReader::open(path)?;
+                        let mut reader =
+                            TableReader::open_with_cache(path, Some(w.block_cache.clone()))?;
                         let seek =
                             encode_internal_key(key, snapshot.read_seq, ValueType::Tombstone);
                         let got = reader.get_by_seek_key_prefix(
@@ -486,6 +491,7 @@ fn bg_worker(db_dir: PathBuf, shared: Arc<Shared>) {
                     file_id,
                     w.next_seq.saturating_sub(1),
                     w.options.sync == SyncMode::Yes,
+                    w.options.bloom_bits_per_key,
                     w.imm_trigger_op_index,
                 ))
             } else {
@@ -495,15 +501,23 @@ fn bg_worker(db_dir: PathBuf, shared: Arc<Shared>) {
             (flush_task, do_compact, shutting_down)
         };
 
-        if let Some((imm, prev_wal_id, log_number, file_id, last_sequence, sync, op_index)) =
-            flush_task
+        if let Some((
+            imm,
+            prev_wal_id,
+            log_number,
+            file_id,
+            last_sequence,
+            sync,
+            bloom_bits_per_key,
+            op_index,
+        )) = flush_task
         {
             let _op_guard = failpoint::set_current_op_index(op_index);
             let tmp_path = db_dir.join(sst_temp_file_name(file_id));
             let final_path = db_dir.join(sst_file_name(file_id));
 
             let flush_res = (|| -> Result<crate::sstable::FileMeta> {
-                let mut builder = TableBuilder::create(&tmp_path)?;
+                let mut builder = TableBuilder::create(&tmp_path, bloom_bits_per_key)?;
                 for (user_key, seq, value_type, value) in imm.iter_user_entries() {
                     let ik = encode_internal_key(user_key, seq, value_type);
                     builder.add(&ik, value)?;
@@ -648,7 +662,7 @@ fn compact_l0_to_l1(db_dir: &Path, w: &mut WriterState) -> Result<()> {
     let mut sources: Vec<Source> = Vec::new();
     for meta in w.version.levels[0].iter().chain(overlap_l1.iter()) {
         let path = db_dir.join(sst_file_name(meta.file_id));
-        let reader = TableReader::open(path)?;
+        let reader = TableReader::open_with_cache(path, Some(w.block_cache.clone()))?;
         let mut scanner = reader.scanner();
         let current = scanner.next_item()?;
         sources.push(Source { scanner, current });
@@ -691,7 +705,7 @@ fn compact_l0_to_l1(db_dir: &Path, w: &mut WriterState) -> Result<()> {
         }
     }
 
-    let mut builder = TableBuilder::create(&tmp_path)?;
+    let mut builder = TableBuilder::create(&tmp_path, w.options.bloom_bits_per_key)?;
     while let Some(Reverse(e)) = heap.pop() {
         builder.add(&e.key, &e.value)?;
         let src = e.src;
@@ -829,7 +843,7 @@ fn compact_level_to_next(db_dir: &Path, w: &mut WriterState, level: usize) -> Re
     let mut sources: Vec<Source> = Vec::new();
     for meta in std::iter::once(&input).chain(overlaps.iter()) {
         let path = db_dir.join(sst_file_name(meta.file_id));
-        let reader = TableReader::open(path)?;
+        let reader = TableReader::open_with_cache(path, Some(w.block_cache.clone()))?;
         let mut scanner = reader.scanner();
         let current = scanner.next_item()?;
         sources.push(Source { scanner, current });
@@ -872,7 +886,7 @@ fn compact_level_to_next(db_dir: &Path, w: &mut WriterState, level: usize) -> Re
         }
     }
 
-    let mut builder = TableBuilder::create(&tmp_path)?;
+    let mut builder = TableBuilder::create(&tmp_path, w.options.bloom_bits_per_key)?;
     while let Some(Reverse(e)) = heap.pop() {
         builder.add(&e.key, &e.value)?;
         let src = e.src;
@@ -1018,10 +1032,16 @@ fn collect_visible_items(
     for level in &w.version.levels {
         for meta in level {
             let path = db_dir.join(sst_file_name(meta.file_id));
-            let reader = TableReader::open(path)?;
+            let reader = TableReader::open_with_cache(path, Some(w.block_cache.clone()))?;
             let mut it = reader.scanner();
+            if let Some(seek) = range_start_seek_internal_key(range) {
+                it.seek(&seek)?;
+            }
             let mut items = Vec::new();
             while let Some((k, v)) = it.next_item()? {
+                if user_key_past_end(&k, range)? {
+                    break;
+                }
                 items.push((k, v));
             }
             sources.push(Source { items, idx: 0 });
@@ -1111,6 +1131,23 @@ fn user_key_in_range(user_key: &[u8], range: &Range) -> bool {
         _ => {}
     }
     true
+}
+
+fn range_start_seek_internal_key(range: &Range) -> Option<Vec<u8>> {
+    match &range.start {
+        Bound::Unbounded => None,
+        Bound::Included(k) => Some(encode_internal_key(k, u64::MAX, ValueType::Tombstone)),
+        Bound::Excluded(k) => Some(encode_internal_key(k, 0, ValueType::Value)),
+    }
+}
+
+fn user_key_past_end(internal_key: &[u8], range: &Range) -> Result<bool> {
+    let parsed = parse_internal_key(internal_key)?;
+    match &range.end {
+        Bound::Unbounded => Ok(false),
+        Bound::Included(k) => Ok(parsed.user_key > k.as_slice()),
+        Bound::Excluded(k) => Ok(parsed.user_key >= k.as_slice()),
+    }
 }
 
 fn encode_batch_as_wal_record(batch: &WriteBatch, start_seq: u64) -> Vec<u8> {
@@ -1274,6 +1311,7 @@ mod tests {
             max_levels: 3,
             level1_target_bytes: 1,
             level_multiplier: 1,
+            ..Options::default()
         };
 
         let db = DB::open(&path, opts).unwrap();

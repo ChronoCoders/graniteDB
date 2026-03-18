@@ -26,7 +26,7 @@ pub fn fuzz_sstable(bytes: &[u8]) {
     if write_file(&path, bytes).is_err() {
         return;
     }
-    if let Ok(r) = TableReader::open(&path) {
+    if let Ok(r) = TableReader::open_with_cache(&path, None) {
         let _ = r.scanner();
     }
     let _ = fs::remove_dir_all(dir);
