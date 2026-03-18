@@ -132,7 +132,7 @@ impl DB {
         if w.memtable.approx_bytes() >= w.options.memtable_max_bytes {
             flush_memtable_to_l0(&self.path, &mut w)?;
         }
-        if w.version.level0.len() > w.options.l0_slowdown_trigger {
+        if w.version.levels[0].len() > w.options.l0_slowdown_trigger {
             compact_l0_to_l1(&self.path, &mut w)?;
         }
 
@@ -169,7 +169,7 @@ impl DB {
             Some(GetDecision::Value(v)) => Ok(Some(v)),
             Some(GetDecision::Deleted) => Ok(None),
             None => {
-                for meta in w.version.level0.iter().rev() {
+                for meta in w.version.levels[0].iter().rev() {
                     let path = self.path.join(sst_file_name(meta.file_id));
                     let mut reader = TableReader::open(path)?;
                     let seek = encode_internal_key(key, snapshot.read_seq, ValueType::Tombstone);
@@ -187,25 +187,30 @@ impl DB {
                         None => {}
                     }
                 }
-                for meta in &w.version.level1 {
-                    if !meta_may_contain_user_key(meta, key)? {
-                        continue;
-                    }
-                    let path = self.path.join(sst_file_name(meta.file_id));
-                    let mut reader = TableReader::open(path)?;
-                    let seek = encode_internal_key(key, snapshot.read_seq, ValueType::Tombstone);
-                    let got =
-                        reader.get_by_seek_key_prefix(&seek, key, snapshot.read_seq, |vt, v| {
-                            match vt {
+                for level in w.version.levels.iter().skip(1) {
+                    for meta in level {
+                        if !meta_may_contain_user_key(meta, key)? {
+                            continue;
+                        }
+                        let path = self.path.join(sst_file_name(meta.file_id));
+                        let mut reader = TableReader::open(path)?;
+                        let seek =
+                            encode_internal_key(key, snapshot.read_seq, ValueType::Tombstone);
+                        let got = reader.get_by_seek_key_prefix(
+                            &seek,
+                            key,
+                            snapshot.read_seq,
+                            |vt, v| match vt {
                                 0 => Some(GetDecision::Deleted),
                                 1 => Some(GetDecision::Value(v.to_vec())),
                                 _ => None,
-                            }
-                        })?;
-                    match got {
-                        Some(GetDecision::Value(v)) => return Ok(Some(v)),
-                        Some(GetDecision::Deleted) => return Ok(None),
-                        None => {}
+                            },
+                        )?;
+                        match got {
+                            Some(GetDecision::Value(v)) => return Ok(Some(v)),
+                            Some(GetDecision::Deleted) => return Ok(None),
+                            None => {}
+                        }
                     }
                 }
                 Ok(None)
@@ -342,7 +347,7 @@ fn flush_memtable_to_l0(db_dir: &Path, w: &mut WriterState) -> Result<()> {
         .append_flush_edit(&meta, new_wal_id, last_sequence)?;
     failpoint::io_err("flush:after_manifest_edit")?;
     failpoint::hit("flush:after_manifest_edit");
-    w.version.level0.push(meta);
+    w.version.levels[0].push(meta);
     w.version.log_number = new_wal_id;
     w.version.last_sequence = w.version.last_sequence.max(last_sequence);
 
@@ -364,13 +369,13 @@ fn meta_may_contain_user_key(meta: &crate::sstable::FileMeta, user_key: &[u8]) -
 }
 
 fn compact_l0_to_l1(db_dir: &Path, w: &mut WriterState) -> Result<()> {
-    if w.version.level0.is_empty() {
+    if w.version.levels[0].is_empty() {
         return Ok(());
     }
 
     let mut min_user: Option<Vec<u8>> = None;
     let mut max_user: Option<Vec<u8>> = None;
-    for m in &w.version.level0 {
+    for m in &w.version.levels[0] {
         let s = parse_internal_key(&m.smallest_key)?.user_key.to_vec();
         let l = parse_internal_key(&m.largest_key)?.user_key.to_vec();
         min_user = Some(match min_user {
@@ -385,9 +390,7 @@ fn compact_l0_to_l1(db_dir: &Path, w: &mut WriterState) -> Result<()> {
     let min_user = min_user.ok_or(GraniteError::Corrupt("missing min user key"))?;
     let max_user = max_user.ok_or(GraniteError::Corrupt("missing max user key"))?;
 
-    let overlap_l1: Vec<crate::sstable::FileMeta> = w
-        .version
-        .level1
+    let overlap_l1: Vec<crate::sstable::FileMeta> = w.version.levels[1]
         .iter()
         .filter(|m| {
             let s = parse_internal_key(&m.smallest_key)
@@ -415,7 +418,7 @@ fn compact_l0_to_l1(db_dir: &Path, w: &mut WriterState) -> Result<()> {
     }
 
     let mut sources: Vec<Source> = Vec::new();
-    for meta in w.version.level0.iter().chain(overlap_l1.iter()) {
+    for meta in w.version.levels[0].iter().chain(overlap_l1.iter()) {
         let path = db_dir.join(sst_file_name(meta.file_id));
         let reader = TableReader::open(path)?;
         let mut scanner = reader.scanner();
@@ -496,7 +499,7 @@ fn compact_l0_to_l1(db_dir: &Path, w: &mut WriterState) -> Result<()> {
         failpoint::hit("compaction:after_dir_sync");
     }
 
-    let l0_ids: Vec<u64> = w.version.level0.iter().map(|m| m.file_id).collect();
+    let l0_ids: Vec<u64> = w.version.levels[0].iter().map(|m| m.file_id).collect();
     let overlap_ids_vec: Vec<u64> = overlap_l1.iter().map(|m| m.file_id).collect();
 
     let mut deletes: Vec<(u32, u64)> = Vec::new();
@@ -513,11 +516,9 @@ fn compact_l0_to_l1(db_dir: &Path, w: &mut WriterState) -> Result<()> {
     w.version.last_sequence = w.version.last_sequence.max(last_sequence);
 
     let overlap_ids: std::collections::BTreeSet<u64> = overlap_ids_vec.iter().copied().collect();
-    w.version.level0.clear();
-    w.version
-        .level1
-        .retain(|m| !overlap_ids.contains(&m.file_id));
-    w.version.level1.push(out_meta);
+    w.version.levels[0].clear();
+    w.version.levels[1].retain(|m| !overlap_ids.contains(&m.file_id));
+    w.version.levels[1].push(out_meta);
 
     for id in l0_ids.into_iter().chain(overlap_ids_vec.into_iter()) {
         let _ = fs::remove_file(db_dir.join(sst_file_name(id)));
@@ -558,26 +559,17 @@ fn collect_visible_items(
         idx: 0,
     });
 
-    for meta in &w.version.level0 {
-        let path = db_dir.join(sst_file_name(meta.file_id));
-        let reader = TableReader::open(path)?;
-        let mut it = reader.scanner();
-        let mut items = Vec::new();
-        while let Some((k, v)) = it.next_item()? {
-            items.push((k, v));
+    for level in &w.version.levels {
+        for meta in level {
+            let path = db_dir.join(sst_file_name(meta.file_id));
+            let reader = TableReader::open(path)?;
+            let mut it = reader.scanner();
+            let mut items = Vec::new();
+            while let Some((k, v)) = it.next_item()? {
+                items.push((k, v));
+            }
+            sources.push(Source { items, idx: 0 });
         }
-        sources.push(Source { items, idx: 0 });
-    }
-
-    for meta in &w.version.level1 {
-        let path = db_dir.join(sst_file_name(meta.file_id));
-        let reader = TableReader::open(path)?;
-        let mut it = reader.scanner();
-        let mut items = Vec::new();
-        while let Some((k, v)) = it.next_item()? {
-            items.push((k, v));
-        }
-        sources.push(Source { items, idx: 0 });
     }
 
     #[derive(Clone, Eq, PartialEq)]

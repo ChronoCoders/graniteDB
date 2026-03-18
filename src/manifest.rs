@@ -39,33 +39,30 @@ const TAG_SET_LAST_SEQUENCE: u8 = 4;
 
 #[derive(Clone, Debug)]
 pub struct VersionSet {
-    pub level0: Vec<FileMeta>,
-    pub level1: Vec<FileMeta>,
+    pub levels: Vec<Vec<FileMeta>>,
     pub log_number: u64,
     pub last_sequence: u64,
 }
 
 impl VersionSet {
     pub fn max_file_id(&self) -> u64 {
-        self.level0
+        self.levels
             .iter()
-            .chain(self.level1.iter())
+            .flatten()
             .map(|m| m.file_id)
             .max()
             .unwrap_or(0)
     }
 
     pub fn contains_file_id(&self, file_id: u64) -> bool {
-        self.level0.iter().any(|m| m.file_id == file_id)
-            || self.level1.iter().any(|m| m.file_id == file_id)
+        self.levels.iter().flatten().any(|m| m.file_id == file_id)
     }
 }
 
 impl Default for VersionSet {
     fn default() -> Self {
         Self {
-            level0: Vec::new(),
-            level1: Vec::new(),
+            levels: vec![Vec::new(), Vec::new()],
             log_number: 1,
             last_sequence: 0,
         }
@@ -245,20 +242,20 @@ fn apply_one_record(version: &mut VersionSet, mut rec: &[u8]) -> Result<()> {
                     smallest_key,
                     largest_key,
                 };
-                match level {
-                    0 => version.level0.push(meta),
-                    1 => version.level1.push(meta),
-                    _ => return Err(GraniteError::InvalidArgument("only L0/L1 supported in v1")),
+                let idx = level as usize;
+                if version.levels.len() <= idx {
+                    version.levels.resize_with(idx + 1, Vec::new);
                 }
+                version.levels[idx].push(meta);
             }
             TAG_DELETE_FILE => {
                 let level = read_u32(&mut rec)?;
                 let file_id = read_u64(&mut rec)?;
-                match level {
-                    0 => version.level0.retain(|m| m.file_id != file_id),
-                    1 => version.level1.retain(|m| m.file_id != file_id),
-                    _ => return Err(GraniteError::InvalidArgument("only L0/L1 supported in v1")),
+                let idx = level as usize;
+                if version.levels.len() <= idx {
+                    version.levels.resize_with(idx + 1, Vec::new);
                 }
+                version.levels[idx].retain(|m| m.file_id != file_id);
             }
             TAG_SET_LOG_NUMBER => {
                 let log_number = read_u64(&mut rec)?;
@@ -507,7 +504,7 @@ mod tests {
     fn manifest_roundtrip_and_truncate_tail() {
         let dir = tempdir().unwrap();
         let (mut m, v0) = Manifest::open(dir.path(), SyncMode::No).unwrap();
-        assert!(v0.level0.is_empty());
+        assert!(v0.levels[0].is_empty());
         assert_eq!(v0.log_number, 1);
         assert_eq!(v0.last_sequence, 0);
 
@@ -526,8 +523,8 @@ mod tests {
         drop(m);
 
         let (_m2, v2) = Manifest::open(dir.path(), SyncMode::No).unwrap();
-        assert_eq!(v2.level0.len(), 1);
-        assert_eq!(v2.level0[0].file_id, 7);
+        assert_eq!(v2.levels[0].len(), 1);
+        assert_eq!(v2.levels[0][0].file_id, 7);
         assert_eq!(v2.log_number, 2);
         assert_eq!(v2.last_sequence, 9);
     }

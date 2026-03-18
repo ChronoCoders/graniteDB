@@ -20,6 +20,7 @@ This directory specifies GraniteDB’s correctness contract, on-disk formats, cr
 14. `14-loom.md`
 15. `15-benchmarking.md`
 16. `16-ci.md`
+17. `17-production-roadmap.md`
 
 ## Non-Negotiables
 

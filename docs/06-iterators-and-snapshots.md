@@ -13,7 +13,7 @@ A correct read path requires a merging iterator across sorted sources:
 Sources (in precedence order):
 
 - MemTable (newest writes)
-- Immutable MemTables (newest to oldest)
+- Immutable MemTables (newest to oldest, planned)
 - L0 SSTs (newest-first; overlapping key ranges)
 - L1+ SSTs (non-overlapping per level)
 
