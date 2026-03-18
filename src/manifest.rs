@@ -185,6 +185,26 @@ impl Manifest {
         self.sync()
     }
 
+    pub fn append_compaction_edit_multi(
+        &mut self,
+        outputs: &[FileMeta],
+        deletes: &[(u32, u64)],
+        last_sequence: u64,
+    ) -> Result<()> {
+        let mut payload = Vec::new();
+        for output in outputs {
+            encode_add_file(&mut payload, output);
+        }
+        for (level, file_id) in deletes {
+            encode_delete_file(&mut payload, *level, *file_id);
+        }
+        encode_set_last_sequence(&mut payload, last_sequence);
+        failpoint::hit("manifest:before_append");
+        self.append_logical_record(&payload)?;
+        failpoint::hit("manifest:after_append");
+        self.sync()
+    }
+
     pub fn append_create_column_family_edit(&mut self, id: u32, name: &str) -> Result<()> {
         let mut payload = Vec::new();
         encode_add_column_family(&mut payload, id, name);

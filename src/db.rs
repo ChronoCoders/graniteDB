@@ -1698,11 +1698,6 @@ fn compact_l0_to_l1(db_dir: &Path, w: &mut WriterState) -> Result<()> {
     let (overlap_l1, _min_user, _max_user) =
         collect_overlaps_expanding(&w.version.levels[1], min_user, max_user)?;
 
-    let file_id = w.next_file_id;
-    w.next_file_id = w.next_file_id.saturating_add(1);
-    let tmp_path = db_dir.join(sst_temp_file_name(file_id));
-    let final_path = db_dir.join(sst_file_name(file_id));
-
     struct Source {
         scanner: crate::sstable::SstScanner,
         current: Option<(Vec<u8>, Vec<u8>)>,
@@ -1754,11 +1749,19 @@ fn compact_l0_to_l1(db_dir: &Path, w: &mut WriterState) -> Result<()> {
         }
     }
 
+    let split_limit_bytes = (level_target_bytes(&w.options, 1) / 2).max(1);
+    let mut builder_file_id = w.next_file_id;
+    w.next_file_id = w.next_file_id.saturating_add(1);
+    let mut builder_tmp_path = db_dir.join(sst_temp_file_name(builder_file_id));
+    let mut builder_final_path = db_dir.join(sst_file_name(builder_file_id));
     let mut builder = TableBuilder::create(
-        &tmp_path,
+        &builder_tmp_path,
         w.options.bloom_bits_per_key,
         w.options.sstable_compression,
     )?;
+    let mut builder_has_data = false;
+    let mut builder_approx_bytes: u64 = 0;
+    let mut outputs: Vec<crate::sstable::FileMeta> = Vec::new();
     let now_micros = now_micros();
     let smallest_snapshot = u64::MAX;
     let mut current_user_key: Option<Vec<u8>> = None;
@@ -1773,6 +1776,40 @@ fn compact_l0_to_l1(db_dir: &Path, w: &mut WriterState) -> Result<()> {
             None => true,
         };
         if is_new_user_key {
+            if builder_has_data && builder_approx_bytes >= split_limit_bytes {
+                failpoint::io_err("compaction:before_sst_finish")?;
+                failpoint::hit("compaction:before_sst_finish");
+                let mut meta = builder.finish(w.options.sync == SyncMode::Yes)?;
+                failpoint::io_err("compaction:after_sst_finish")?;
+                failpoint::hit("compaction:after_sst_finish");
+                meta.file_id = builder_file_id;
+                meta.level = 1;
+                failpoint::io_err("compaction:before_sst_rename")?;
+                failpoint::hit("compaction:before_sst_rename");
+                fs::rename(&builder_tmp_path, &builder_final_path)?;
+                failpoint::io_err("compaction:after_sst_rename")?;
+                failpoint::hit("compaction:after_sst_rename");
+                if w.options.sync == SyncMode::Yes {
+                    failpoint::io_err("compaction:before_dir_sync")?;
+                    failpoint::hit("compaction:before_dir_sync");
+                    sync_parent_dir(&builder_final_path)?;
+                    failpoint::io_err("compaction:after_dir_sync")?;
+                    failpoint::hit("compaction:after_dir_sync");
+                }
+                outputs.push(meta);
+
+                builder_file_id = w.next_file_id;
+                w.next_file_id = w.next_file_id.saturating_add(1);
+                builder_tmp_path = db_dir.join(sst_temp_file_name(builder_file_id));
+                builder_final_path = db_dir.join(sst_file_name(builder_file_id));
+                builder = TableBuilder::create(
+                    &builder_tmp_path,
+                    w.options.bloom_bits_per_key,
+                    w.options.sstable_compression,
+                )?;
+                builder_has_data = false;
+                builder_approx_bytes = 0;
+            }
             current_user_key = Some(user_key.clone());
             kept_snapshot_version_for_user_key = false;
         }
@@ -1810,6 +1847,12 @@ fn compact_l0_to_l1(db_dir: &Path, w: &mut WriterState) -> Result<()> {
         }
 
         builder.add(&out_key, &out_value)?;
+        builder_has_data = true;
+        builder_approx_bytes = builder_approx_bytes.saturating_add(
+            (out_key.len() as u64)
+                .saturating_add(out_value.len() as u64)
+                .saturating_add(16),
+        );
         if w.options.drop_obsolete_versions_during_compaction
             && seq <= smallest_snapshot
             && matches!(value_type, ValueType::Value | ValueType::Tombstone)
@@ -1827,26 +1870,28 @@ fn compact_l0_to_l1(db_dir: &Path, w: &mut WriterState) -> Result<()> {
             }));
         }
     }
-    failpoint::io_err("compaction:before_sst_finish")?;
-    failpoint::hit("compaction:before_sst_finish");
-    let mut out_meta = builder.finish(w.options.sync == SyncMode::Yes)?;
-    failpoint::io_err("compaction:after_sst_finish")?;
-    failpoint::hit("compaction:after_sst_finish");
-    out_meta.file_id = file_id;
-    out_meta.level = 1;
     drop(sources);
-
-    failpoint::io_err("compaction:before_sst_rename")?;
-    failpoint::hit("compaction:before_sst_rename");
-    fs::rename(&tmp_path, &final_path)?;
-    failpoint::io_err("compaction:after_sst_rename")?;
-    failpoint::hit("compaction:after_sst_rename");
-    if w.options.sync == SyncMode::Yes {
-        failpoint::io_err("compaction:before_dir_sync")?;
-        failpoint::hit("compaction:before_dir_sync");
-        sync_parent_dir(&final_path)?;
-        failpoint::io_err("compaction:after_dir_sync")?;
-        failpoint::hit("compaction:after_dir_sync");
+    if builder_has_data {
+        failpoint::io_err("compaction:before_sst_finish")?;
+        failpoint::hit("compaction:before_sst_finish");
+        let mut meta = builder.finish(w.options.sync == SyncMode::Yes)?;
+        failpoint::io_err("compaction:after_sst_finish")?;
+        failpoint::hit("compaction:after_sst_finish");
+        meta.file_id = builder_file_id;
+        meta.level = 1;
+        failpoint::io_err("compaction:before_sst_rename")?;
+        failpoint::hit("compaction:before_sst_rename");
+        fs::rename(&builder_tmp_path, &builder_final_path)?;
+        failpoint::io_err("compaction:after_sst_rename")?;
+        failpoint::hit("compaction:after_sst_rename");
+        if w.options.sync == SyncMode::Yes {
+            failpoint::io_err("compaction:before_dir_sync")?;
+            failpoint::hit("compaction:before_dir_sync");
+            sync_parent_dir(&builder_final_path)?;
+            failpoint::io_err("compaction:after_dir_sync")?;
+            failpoint::hit("compaction:after_dir_sync");
+        }
+        outputs.push(meta);
     }
 
     let l0_ids: Vec<u64> = w.version.levels[0].iter().map(|m| m.file_id).collect();
@@ -1860,7 +1905,7 @@ fn compact_l0_to_l1(db_dir: &Path, w: &mut WriterState) -> Result<()> {
     failpoint::io_err("compaction:before_manifest_edit")?;
     failpoint::hit("compaction:before_manifest_edit");
     w.manifest
-        .append_compaction_edit(&out_meta, &deletes, last_sequence)?;
+        .append_compaction_edit_multi(&outputs, &deletes, last_sequence)?;
     failpoint::io_err("compaction:after_manifest_edit")?;
     failpoint::hit("compaction:after_manifest_edit");
     w.version.last_sequence = w.version.last_sequence.max(last_sequence);
@@ -1868,7 +1913,7 @@ fn compact_l0_to_l1(db_dir: &Path, w: &mut WriterState) -> Result<()> {
     let overlap_ids: std::collections::BTreeSet<u64> = overlap_ids_vec.iter().copied().collect();
     w.version.levels[0].clear();
     w.version.levels[1].retain(|m| !overlap_ids.contains(&m.file_id));
-    w.version.levels[1].push(out_meta);
+    w.version.levels[1].extend(outputs);
 
     for id in l0_ids.into_iter().chain(overlap_ids_vec.into_iter()) {
         let _ = fs::remove_file(db_dir.join(sst_file_name(id)));
@@ -1971,11 +2016,6 @@ fn compact_level_to_next(db_dir: &Path, w: &mut WriterState, level: usize) -> Re
         return Ok(());
     }
 
-    let file_id = w.next_file_id;
-    w.next_file_id = w.next_file_id.saturating_add(1);
-    let tmp_path = db_dir.join(sst_temp_file_name(file_id));
-    let final_path = db_dir.join(sst_file_name(file_id));
-
     struct Source {
         scanner: crate::sstable::SstScanner,
         current: Option<(Vec<u8>, Vec<u8>)>,
@@ -2027,11 +2067,19 @@ fn compact_level_to_next(db_dir: &Path, w: &mut WriterState, level: usize) -> Re
         }
     }
 
+    let split_limit_bytes = (level_target_bytes(&w.options, level + 1) / 2).max(1);
+    let mut builder_file_id = w.next_file_id;
+    w.next_file_id = w.next_file_id.saturating_add(1);
+    let mut builder_tmp_path = db_dir.join(sst_temp_file_name(builder_file_id));
+    let mut builder_final_path = db_dir.join(sst_file_name(builder_file_id));
     let mut builder = TableBuilder::create(
-        &tmp_path,
+        &builder_tmp_path,
         w.options.bloom_bits_per_key,
         w.options.sstable_compression,
     )?;
+    let mut builder_has_data = false;
+    let mut builder_approx_bytes: u64 = 0;
+    let mut outputs: Vec<crate::sstable::FileMeta> = Vec::new();
     let now_micros = now_micros();
     let smallest_snapshot = u64::MAX;
     let mut current_user_key: Option<Vec<u8>> = None;
@@ -2046,6 +2094,41 @@ fn compact_level_to_next(db_dir: &Path, w: &mut WriterState, level: usize) -> Re
             None => true,
         };
         if is_new_user_key {
+            if builder_has_data && builder_approx_bytes >= split_limit_bytes {
+                failpoint::io_err("compaction:before_sst_finish")?;
+                failpoint::hit("compaction:before_sst_finish");
+                let mut meta = builder.finish(w.options.sync == SyncMode::Yes)?;
+                failpoint::io_err("compaction:after_sst_finish")?;
+                failpoint::hit("compaction:after_sst_finish");
+                meta.file_id = builder_file_id;
+                meta.level = (level + 1) as u32;
+
+                failpoint::io_err("compaction:before_sst_rename")?;
+                failpoint::hit("compaction:before_sst_rename");
+                fs::rename(&builder_tmp_path, &builder_final_path)?;
+                failpoint::io_err("compaction:after_sst_rename")?;
+                failpoint::hit("compaction:after_sst_rename");
+                if w.options.sync == SyncMode::Yes {
+                    failpoint::io_err("compaction:before_dir_sync")?;
+                    failpoint::hit("compaction:before_dir_sync");
+                    sync_parent_dir(&builder_final_path)?;
+                    failpoint::io_err("compaction:after_dir_sync")?;
+                    failpoint::hit("compaction:after_dir_sync");
+                }
+                outputs.push(meta);
+
+                builder_file_id = w.next_file_id;
+                w.next_file_id = w.next_file_id.saturating_add(1);
+                builder_tmp_path = db_dir.join(sst_temp_file_name(builder_file_id));
+                builder_final_path = db_dir.join(sst_file_name(builder_file_id));
+                builder = TableBuilder::create(
+                    &builder_tmp_path,
+                    w.options.bloom_bits_per_key,
+                    w.options.sstable_compression,
+                )?;
+                builder_has_data = false;
+                builder_approx_bytes = 0;
+            }
             current_user_key = Some(user_key.clone());
             kept_snapshot_version_for_user_key = false;
         }
@@ -2083,6 +2166,12 @@ fn compact_level_to_next(db_dir: &Path, w: &mut WriterState, level: usize) -> Re
         }
 
         builder.add(&out_key, &out_value)?;
+        builder_has_data = true;
+        builder_approx_bytes = builder_approx_bytes.saturating_add(
+            (out_key.len() as u64)
+                .saturating_add(out_value.len() as u64)
+                .saturating_add(16),
+        );
         if w.options.drop_obsolete_versions_during_compaction
             && seq <= smallest_snapshot
             && matches!(value_type, ValueType::Value | ValueType::Tombstone)
@@ -2101,26 +2190,29 @@ fn compact_level_to_next(db_dir: &Path, w: &mut WriterState, level: usize) -> Re
         }
     }
 
-    failpoint::io_err("compaction:before_sst_finish")?;
-    failpoint::hit("compaction:before_sst_finish");
-    let mut out_meta = builder.finish(w.options.sync == SyncMode::Yes)?;
-    failpoint::io_err("compaction:after_sst_finish")?;
-    failpoint::hit("compaction:after_sst_finish");
-    out_meta.file_id = file_id;
-    out_meta.level = (level + 1) as u32;
     drop(sources);
+    if builder_has_data {
+        failpoint::io_err("compaction:before_sst_finish")?;
+        failpoint::hit("compaction:before_sst_finish");
+        let mut meta = builder.finish(w.options.sync == SyncMode::Yes)?;
+        failpoint::io_err("compaction:after_sst_finish")?;
+        failpoint::hit("compaction:after_sst_finish");
+        meta.file_id = builder_file_id;
+        meta.level = (level + 1) as u32;
 
-    failpoint::io_err("compaction:before_sst_rename")?;
-    failpoint::hit("compaction:before_sst_rename");
-    fs::rename(&tmp_path, &final_path)?;
-    failpoint::io_err("compaction:after_sst_rename")?;
-    failpoint::hit("compaction:after_sst_rename");
-    if w.options.sync == SyncMode::Yes {
-        failpoint::io_err("compaction:before_dir_sync")?;
-        failpoint::hit("compaction:before_dir_sync");
-        sync_parent_dir(&final_path)?;
-        failpoint::io_err("compaction:after_dir_sync")?;
-        failpoint::hit("compaction:after_dir_sync");
+        failpoint::io_err("compaction:before_sst_rename")?;
+        failpoint::hit("compaction:before_sst_rename");
+        fs::rename(&builder_tmp_path, &builder_final_path)?;
+        failpoint::io_err("compaction:after_sst_rename")?;
+        failpoint::hit("compaction:after_sst_rename");
+        if w.options.sync == SyncMode::Yes {
+            failpoint::io_err("compaction:before_dir_sync")?;
+            failpoint::hit("compaction:before_dir_sync");
+            sync_parent_dir(&builder_final_path)?;
+            failpoint::io_err("compaction:after_dir_sync")?;
+            failpoint::hit("compaction:after_dir_sync");
+        }
+        outputs.push(meta);
     }
 
     let mut deletes: Vec<(u32, u64)> = Vec::new();
@@ -2131,7 +2223,7 @@ fn compact_level_to_next(db_dir: &Path, w: &mut WriterState, level: usize) -> Re
     failpoint::io_err("compaction:before_manifest_edit")?;
     failpoint::hit("compaction:before_manifest_edit");
     w.manifest
-        .append_compaction_edit(&out_meta, &deletes, last_sequence)?;
+        .append_compaction_edit_multi(&outputs, &deletes, last_sequence)?;
     failpoint::io_err("compaction:after_manifest_edit")?;
     failpoint::hit("compaction:after_manifest_edit");
     w.version.last_sequence = w.version.last_sequence.max(last_sequence);
@@ -2139,7 +2231,7 @@ fn compact_level_to_next(db_dir: &Path, w: &mut WriterState, level: usize) -> Re
     w.version.levels[level].retain(|m| m.file_id != input.file_id);
     let overlap_ids: std::collections::BTreeSet<u64> = overlaps.iter().map(|m| m.file_id).collect();
     w.version.levels[level + 1].retain(|m| !overlap_ids.contains(&m.file_id));
-    w.version.levels[level + 1].push(out_meta);
+    w.version.levels[level + 1].extend(outputs);
 
     let _ = fs::remove_file(db_dir.join(sst_file_name(input.file_id)));
     for id in overlap_ids {
@@ -2662,6 +2754,46 @@ mod tests {
         )
         .unwrap();
         db3.close().unwrap();
+    }
+
+    #[test]
+    fn compaction_can_split_into_multiple_output_files() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("db");
+        let opts = Options {
+            sync: SyncMode::No,
+            memtable_max_bytes: 1,
+            l0_slowdown_trigger: 0,
+            l0_stop_trigger: 0,
+            max_levels: 2,
+            level1_target_bytes: 200,
+            level_multiplier: 1,
+            ..Options::default()
+        };
+
+        let db = DB::open(&path, opts).unwrap();
+        for i in 0..20u8 {
+            let k = [b'k', i];
+            db.put(&k, &vec![b'x'; 80]).unwrap();
+        }
+
+        for _ in 0..500 {
+            let w = db.shared.state.lock().unwrap();
+            if w.version.levels[0].is_empty() && w.version.levels[1].len() >= 2 {
+                break;
+            }
+            drop(w);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let w = db.shared.state.lock().unwrap();
+        assert!(w.version.levels[0].is_empty());
+        assert!(w.version.levels[1].len() >= 2);
+        drop(w);
+
+        assert_eq!(db.get(b"k\x00").unwrap(), Some(vec![b'x'; 80]));
+        assert_eq!(db.get(b"k\x13").unwrap(), Some(vec![b'x'; 80]));
+        db.close().unwrap();
     }
 
     #[test]
