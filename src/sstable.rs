@@ -1,8 +1,9 @@
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use crate::error::{GraniteError, Result};
+use crate::failpoint;
 use crate::internal_key::{
     INTERNAL_KEY_SUFFIX_LEN, ValueType, cmp_internal_key_bytes, cmp_internal_key_bytes_unchecked,
     parse_internal_key,
@@ -87,7 +88,7 @@ impl TableBuilder {
 
         let index_off = self.file.seek(SeekFrom::End(0))?;
         let index_bytes = encode_index_block(&self.index);
-        self.file.write_all(&index_bytes)?;
+        failpoint::write_all("sst:write_index", &mut self.file, &index_bytes)?;
         let index_len = index_bytes.len() as u64;
 
         let filter_off = 0u64;
@@ -99,10 +100,10 @@ impl TableBuilder {
         footer.extend_from_slice(&filter_off.to_le_bytes());
         footer.extend_from_slice(&filter_len.to_le_bytes());
         footer.extend_from_slice(&MAGIC_U64_LE.to_le_bytes());
-        self.file.write_all(&footer)?;
+        failpoint::write_all("sst:write_footer", &mut self.file, &footer)?;
 
         if sync {
-            self.file.sync_data()?;
+            failpoint::sync_data("sst:sync", &self.file)?;
         }
         let file_size = self.file.metadata()?.len();
         Ok(FileMeta {
@@ -120,10 +121,10 @@ impl TableBuilder {
 
     fn flush_data_block(&mut self) -> Result<()> {
         let block_offset = self.file.seek(SeekFrom::End(0))?;
-        self.file.write_all(&self.data_block_buf)?;
+        failpoint::write_all("sst:write_data", &mut self.file, &self.data_block_buf)?;
         let crc = crc32c::crc32c(&self.data_block_buf);
-        self.file.write_all(&crc.to_le_bytes())?;
-        self.file.write_all(&[0u8])?;
+        failpoint::write_all("sst:write_trailer", &mut self.file, &crc.to_le_bytes())?;
+        failpoint::write_all("sst:write_trailer", &mut self.file, &[0u8])?;
         let block_len = (self.data_block_buf.len() + BLOCK_TRAILER_LEN) as u32;
 
         let sep_key = self.data_block_last_key.clone();

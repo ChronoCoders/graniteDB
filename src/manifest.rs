@@ -133,10 +133,8 @@ impl Manifest {
         encode_add_file(&mut payload, meta);
         encode_set_log_number(&mut payload, new_log_number);
         encode_set_last_sequence(&mut payload, last_sequence);
-        failpoint::io_err("manifest:before_append")?;
         failpoint::hit("manifest:before_append");
         self.append_logical_record(&payload)?;
-        failpoint::io_err("manifest:after_append")?;
         failpoint::hit("manifest:after_append");
         self.sync()
     }
@@ -153,10 +151,8 @@ impl Manifest {
             encode_delete_file(&mut payload, *level, *file_id);
         }
         encode_set_last_sequence(&mut payload, last_sequence);
-        failpoint::io_err("manifest:before_append")?;
         failpoint::hit("manifest:before_append");
         self.append_logical_record(&payload)?;
-        failpoint::io_err("manifest:after_append")?;
         failpoint::hit("manifest:after_append");
         self.sync()
     }
@@ -164,8 +160,7 @@ impl Manifest {
     pub fn sync(&mut self) -> Result<()> {
         if self.sync_mode == SyncMode::Yes {
             failpoint::hit("manifest:before_sync");
-            failpoint::io_err("manifest:sync")?;
-            self.file.sync_data()?;
+            failpoint::sync_data("manifest:sync", &self.file)?;
             failpoint::hit("manifest:after_sync");
         }
         Ok(())
@@ -180,9 +175,8 @@ impl Manifest {
             let block_remaining = BLOCK_SIZE - self.offset_in_block;
             if block_remaining < HEADER_SIZE {
                 if block_remaining > 0 {
-                    failpoint::io_err("manifest:write_padding")?;
                     let padding = vec![0u8; block_remaining];
-                    self.file.write_all(&padding)?;
+                    failpoint::write_all("manifest:write_padding", &mut self.file, &padding)?;
                 }
                 self.offset_in_block = 0;
                 continue;
@@ -214,10 +208,8 @@ impl Manifest {
             header[4..6].copy_from_slice(&(chunk_len as u16).to_le_bytes());
             header[6] = record_type as u8;
 
-            failpoint::io_err("manifest:write_header")?;
-            self.file.write_all(&header)?;
-            failpoint::io_err("manifest:write_payload")?;
-            self.file.write_all(chunk)?;
+            failpoint::write_all("manifest:write_header", &mut self.file, &header)?;
+            failpoint::write_all("manifest:write_payload", &mut self.file, chunk)?;
 
             self.offset_in_block += HEADER_SIZE + chunk_len;
             remaining = &remaining[chunk_len..];

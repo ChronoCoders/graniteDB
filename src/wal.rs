@@ -1,5 +1,5 @@
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use crate::error::{GraniteError, Result};
@@ -80,9 +80,8 @@ impl Wal {
             let block_remaining = WAL_BLOCK_SIZE - self.offset_in_block;
             if block_remaining < WAL_HEADER_SIZE {
                 if block_remaining > 0 {
-                    failpoint::io_err("wal:write_padding")?;
                     let padding = vec![0u8; block_remaining];
-                    self.file.write_all(&padding)?;
+                    failpoint::write_all("wal:write_padding", &mut self.file, &padding)?;
                     failpoint::hit("wal:after_padding");
                 }
                 self.offset_in_block = 0;
@@ -115,11 +114,9 @@ impl Wal {
             header[4..6].copy_from_slice(&(chunk_len as u16).to_le_bytes());
             header[6] = record_type as u8;
 
-            failpoint::io_err("wal:write_header")?;
-            self.file.write_all(&header)?;
+            failpoint::write_all("wal:write_header", &mut self.file, &header)?;
             failpoint::hit("wal:after_header");
-            failpoint::io_err("wal:write_payload")?;
-            self.file.write_all(chunk)?;
+            failpoint::write_all("wal:write_payload", &mut self.file, chunk)?;
             failpoint::hit("wal:after_payload");
 
             self.offset_in_block += WAL_HEADER_SIZE + chunk_len;
@@ -133,8 +130,7 @@ impl Wal {
     pub fn sync(&mut self) -> Result<()> {
         if self.sync_mode == SyncMode::Yes {
             failpoint::hit("wal:before_sync");
-            failpoint::io_err("wal:sync")?;
-            self.file.sync_data()?;
+            failpoint::sync_data("wal:sync", &self.file)?;
             failpoint::hit("wal:after_sync");
         }
         Ok(())

@@ -106,35 +106,72 @@ fn run_crash_case(
     scenario: &str,
     sync: SyncMode,
 ) {
-    let case_path = base_path.join(case_dir_name(failpoint, crash_op, scenario));
+    run_case(
+        base_path,
+        CrashCase {
+            seed,
+            op_count,
+            crash_op,
+            failpoint: failpoint.to_string(),
+            scenario: scenario.to_string(),
+            sync,
+            action: "abort".to_string(),
+        },
+    );
+}
+
+struct CrashCase {
+    seed: u64,
+    op_count: u64,
+    crash_op: u64,
+    failpoint: String,
+    scenario: String,
+    sync: SyncMode,
+    action: String,
+}
+
+fn run_case(base_path: &std::path::Path, case: CrashCase) {
+    let case_path = base_path.join(case_dir_name(
+        &case.failpoint,
+        case.crash_op,
+        &case.scenario,
+    ));
     let status = Command::new(env!("CARGO_BIN_EXE_crash_worker"))
         .arg(&case_path)
-        .arg(seed.to_string())
-        .arg(op_count.to_string())
-        .arg(match sync {
+        .arg(case.seed.to_string())
+        .arg(case.op_count.to_string())
+        .arg(match case.sync {
             SyncMode::Yes => "yes",
             SyncMode::No => "no",
         })
-        .arg(scenario)
-        .env("GRANITEDB_FAILPOINT", failpoint)
-        .env("GRANITEDB_FAILPOINT_OP", crash_op.to_string())
-        .env("GRANITEDB_FAILPOINT_ACTION", "abort")
+        .arg(&case.scenario)
+        .env("GRANITEDB_FAILPOINT", &case.failpoint)
+        .env("GRANITEDB_FAILPOINT_OP", case.crash_op.to_string())
+        .env("GRANITEDB_FAILPOINT_ACTION", &case.action)
         .status()
         .expect("spawn crash worker");
 
     assert!(
         !status.success(),
-        "expected crash for failpoint={failpoint} op={crash_op} scenario={scenario}"
+        "expected crash for failpoint={} op={} scenario={} action={}",
+        case.failpoint,
+        case.crash_op,
+        case.scenario,
+        case.action
     );
 
     let acked_writes = read_acked_writes(&case_path);
-    let expected_a = compute_expected_state(seed, op_count, acked_writes, scenario);
-    let expected_b =
-        compute_expected_state(seed, op_count, acked_writes.saturating_add(1), scenario);
+    let expected_a = compute_expected_state(case.seed, case.op_count, acked_writes, &case.scenario);
+    let expected_b = compute_expected_state(
+        case.seed,
+        case.op_count,
+        acked_writes.saturating_add(1),
+        &case.scenario,
+    );
     let db = DB::open(
         &case_path,
         Options {
-            sync,
+            sync: case.sync,
             ..Options::default()
         },
     )

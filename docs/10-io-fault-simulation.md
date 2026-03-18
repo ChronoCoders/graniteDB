@@ -8,6 +8,10 @@ GraniteDB supports injected IO errors via failpoints:
 
 - `GRANITEDB_FAILPOINT`: failpoint name
 - `GRANITEDB_FAILPOINT_ACTION=ioerr`: return an IO error at that point
+- `GRANITEDB_FAILPOINT_ACTION=partial:<n>`: write the first `<n>` bytes and then return a write error
+- `GRANITEDB_FAILPOINT_ACTION=torn_abort:<n>`: write the first `<n>` bytes and then abort the process
+- `GRANITEDB_FAILPOINT_ACTION=corrupt_abort:<i>`: flip one byte at index `<i>` of the buffer, write, then abort
+- `GRANITEDB_FAILPOINT_ACTION=diskfull:<n>`: write the first `<n>` bytes and then return a write error
 - `GRANITEDB_FAILPOINT_OP=<n>`: optional op index selector (write op index)
 
 Crash injection still uses:
@@ -31,6 +35,14 @@ Manifest:
 - `manifest:before_append`
 - `manifest:after_append`
 - `manifest:sync`
+
+SSTable:
+
+- `sst:write_data`
+- `sst:write_trailer`
+- `sst:write_index`
+- `sst:write_footer`
+- `sst:sync`
 
 Flush:
 
