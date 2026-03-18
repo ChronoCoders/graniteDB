@@ -129,6 +129,13 @@ impl DB {
         w.next_op_index = w.next_op_index.saturating_add(1);
         let _op_guard = failpoint::set_current_op_index(op_index);
 
+        if w.memtable.approx_bytes() >= w.options.memtable_max_bytes {
+            flush_memtable_to_l0(&self.path, &mut w)?;
+        }
+        if w.version.level0.len() > w.options.l0_slowdown_trigger {
+            compact_l0_to_l1(&self.path, &mut w)?;
+        }
+
         let record = encode_batch_as_wal_record(&batch);
         w.wal.append_logical_record(&record)?;
         if w.options.sync == SyncMode::Yes {
@@ -137,12 +144,6 @@ impl DB {
         let mut next_seq = w.next_seq;
         apply_batch_to_memtable(&mut w.memtable, &batch, &mut next_seq)?;
         w.next_seq = next_seq;
-        if w.memtable.approx_bytes() >= w.options.memtable_max_bytes {
-            flush_memtable_to_l0(&self.path, &mut w)?;
-        }
-        if w.version.level0.len() > w.options.l0_slowdown_trigger {
-            compact_l0_to_l1(&self.path, &mut w)?;
-        }
         Ok(())
     }
 
@@ -301,9 +302,11 @@ fn flush_memtable_to_l0(db_dir: &Path, w: &mut WriterState) -> Result<()> {
 
     let new_wal_id = w.wal_id.saturating_add(1);
     let new_wal_path = db_dir.join(wal_file_name(new_wal_id));
+    failpoint::io_err("flush:before_new_wal_create")?;
     failpoint::hit("flush:before_new_wal_create");
     let (new_wal, _recovery) = Wal::open(&new_wal_path, w.options.sync)?;
     drop(new_wal);
+    failpoint::io_err("flush:after_new_wal_create")?;
     failpoint::hit("flush:after_new_wal_create");
 
     let mut builder = TableBuilder::create(&tmp_path)?;
@@ -311,25 +314,33 @@ fn flush_memtable_to_l0(db_dir: &Path, w: &mut WriterState) -> Result<()> {
         let ik = encode_internal_key(user_key, seq, value_type);
         builder.add(&ik, value)?;
     }
+    failpoint::io_err("flush:before_sst_finish")?;
     failpoint::hit("flush:before_sst_finish");
     let mut meta = builder.finish(w.options.sync == SyncMode::Yes)?;
+    failpoint::io_err("flush:after_sst_finish")?;
     failpoint::hit("flush:after_sst_finish");
     meta.file_id = file_id;
     meta.level = 0;
 
+    failpoint::io_err("flush:before_sst_rename")?;
     failpoint::hit("flush:before_sst_rename");
     fs::rename(&tmp_path, &final_path)?;
+    failpoint::io_err("flush:after_sst_rename")?;
     failpoint::hit("flush:after_sst_rename");
     if w.options.sync == SyncMode::Yes {
+        failpoint::io_err("flush:before_dir_sync")?;
         failpoint::hit("flush:before_dir_sync");
         sync_parent_dir(&final_path)?;
+        failpoint::io_err("flush:after_dir_sync")?;
         failpoint::hit("flush:after_dir_sync");
     }
 
     let last_sequence = w.next_seq.saturating_sub(1);
+    failpoint::io_err("flush:before_manifest_edit")?;
     failpoint::hit("flush:before_manifest_edit");
     w.manifest
         .append_flush_edit(&meta, new_wal_id, last_sequence)?;
+    failpoint::io_err("flush:after_manifest_edit")?;
     failpoint::hit("flush:after_manifest_edit");
     w.version.level0.push(meta);
     w.version.log_number = new_wal_id;
@@ -463,19 +474,25 @@ fn compact_l0_to_l1(db_dir: &Path, w: &mut WriterState) -> Result<()> {
             }));
         }
     }
+    failpoint::io_err("compaction:before_sst_finish")?;
     failpoint::hit("compaction:before_sst_finish");
     let mut out_meta = builder.finish(w.options.sync == SyncMode::Yes)?;
+    failpoint::io_err("compaction:after_sst_finish")?;
     failpoint::hit("compaction:after_sst_finish");
     out_meta.file_id = file_id;
     out_meta.level = 1;
     drop(sources);
 
+    failpoint::io_err("compaction:before_sst_rename")?;
     failpoint::hit("compaction:before_sst_rename");
     fs::rename(&tmp_path, &final_path)?;
+    failpoint::io_err("compaction:after_sst_rename")?;
     failpoint::hit("compaction:after_sst_rename");
     if w.options.sync == SyncMode::Yes {
+        failpoint::io_err("compaction:before_dir_sync")?;
         failpoint::hit("compaction:before_dir_sync");
         sync_parent_dir(&final_path)?;
+        failpoint::io_err("compaction:after_dir_sync")?;
         failpoint::hit("compaction:after_dir_sync");
     }
 
@@ -487,9 +504,11 @@ fn compact_l0_to_l1(db_dir: &Path, w: &mut WriterState) -> Result<()> {
     deletes.extend(overlap_ids_vec.iter().map(|id| (1u32, *id)));
 
     let last_sequence = w.next_seq.saturating_sub(1);
+    failpoint::io_err("compaction:before_manifest_edit")?;
     failpoint::hit("compaction:before_manifest_edit");
     w.manifest
         .append_compaction_edit(&out_meta, &deletes, last_sequence)?;
+    failpoint::io_err("compaction:after_manifest_edit")?;
     failpoint::hit("compaction:after_manifest_edit");
     w.version.last_sequence = w.version.last_sequence.max(last_sequence);
 
@@ -799,6 +818,6 @@ mod tests {
                 sst_count += 1;
             }
         }
-        assert_eq!(sst_count, 2);
+        assert_eq!(sst_count, 1);
     }
 }

@@ -64,7 +64,7 @@ fn crash_in_wal_write_does_not_corrupt_and_preserves_prefix() {
             &base_path,
             seed,
             op_count,
-            0,
+            1,
             failpoint,
             "flush",
             SyncMode::Yes,
@@ -89,7 +89,7 @@ fn crash_in_wal_write_does_not_corrupt_and_preserves_prefix() {
             &base_path,
             seed,
             op_count,
-            1,
+            2,
             failpoint,
             "compaction",
             SyncMode::Yes,
@@ -122,7 +122,10 @@ fn run_crash_case(
         .status()
         .expect("spawn crash worker");
 
-    assert!(!status.success());
+    assert!(
+        !status.success(),
+        "expected crash for failpoint={failpoint} op={crash_op} scenario={scenario}"
+    );
 
     let acked_writes = read_acked_writes(&case_path);
     let expected_a = compute_expected_state(seed, op_count, acked_writes, scenario);
@@ -193,6 +196,9 @@ fn compute_expected_state(
             if writes_to_apply >= 1 {
                 state.insert(b"a".to_vec(), Some(format!("flush:{seed}").into_bytes()));
             }
+            if writes_to_apply >= 2 {
+                state.insert(b"b".to_vec(), Some(format!("flush2:{seed}").into_bytes()));
+            }
             state
         }
         "compaction" => {
@@ -202,6 +208,9 @@ fn compute_expected_state(
             }
             if writes_to_apply >= 2 {
                 state.insert(b"b".to_vec(), Some(format!("c2:{seed}").into_bytes()));
+            }
+            if writes_to_apply >= 3 {
+                state.insert(b"c".to_vec(), Some(format!("c3:{seed}").into_bytes()));
             }
             state
         }

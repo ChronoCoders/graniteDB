@@ -80,6 +80,7 @@ impl Wal {
             let block_remaining = WAL_BLOCK_SIZE - self.offset_in_block;
             if block_remaining < WAL_HEADER_SIZE {
                 if block_remaining > 0 {
+                    failpoint::io_err("wal:write_padding")?;
                     let padding = vec![0u8; block_remaining];
                     self.file.write_all(&padding)?;
                     failpoint::hit("wal:after_padding");
@@ -114,8 +115,10 @@ impl Wal {
             header[4..6].copy_from_slice(&(chunk_len as u16).to_le_bytes());
             header[6] = record_type as u8;
 
+            failpoint::io_err("wal:write_header")?;
             self.file.write_all(&header)?;
             failpoint::hit("wal:after_header");
+            failpoint::io_err("wal:write_payload")?;
             self.file.write_all(chunk)?;
             failpoint::hit("wal:after_payload");
 
@@ -130,6 +133,7 @@ impl Wal {
     pub fn sync(&mut self) -> Result<()> {
         if self.sync_mode == SyncMode::Yes {
             failpoint::hit("wal:before_sync");
+            failpoint::io_err("wal:sync")?;
             self.file.sync_data()?;
             failpoint::hit("wal:after_sync");
         }

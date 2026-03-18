@@ -13,6 +13,7 @@ This directory specifies GraniteDB’s correctness contract, on-disk formats, cr
 7. `07-crash-consistency-and-testing.md`
 8. `08-operations.md`
 9. `09-verification-tools.md`
+10. `10-io-fault-simulation.md`
 
 ## Non-Negotiables
 

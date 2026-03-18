@@ -36,11 +36,24 @@ fn main() {
             l0_slowdown_trigger: 1,
             l0_stop_trigger: 2,
         },
+        "ioerr_flush" => Options {
+            sync,
+            memtable_max_bytes: 1,
+            l0_slowdown_trigger: 1000,
+            l0_stop_trigger: 2000,
+        },
+        "ioerr_compaction" => Options {
+            sync,
+            memtable_max_bytes: 1,
+            l0_slowdown_trigger: 1,
+            l0_stop_trigger: 2,
+        },
         _ => Options {
             sync,
             ..Options::default()
         },
     };
+
     let db = DB::open(&db_path, opts).expect("open db");
 
     let mut ack_log = OpenOptions::new()
@@ -53,6 +66,8 @@ fn main() {
         "padding" => run_padding_scenario(&db, seed, &mut ack_log),
         "flush" => run_flush_scenario(&db, seed, &mut ack_log),
         "compaction" => run_compaction_scenario(&db, seed, &mut ack_log),
+        "ioerr_flush" => run_ioerr_flush_scenario(&db, seed, &mut ack_log),
+        "ioerr_compaction" => run_ioerr_compaction_scenario(&db, seed, &mut ack_log),
         _ => run_random_scenario(&db, seed, op_count, &mut ack_log),
     };
     db.close().expect("close");
@@ -100,15 +115,44 @@ fn run_flush_scenario(db: &DB, seed: u64, ack_log: &mut std::fs::File) {
     let value = format!("flush:{seed}").into_bytes();
     db.put(b"a", &value).expect("put flush");
     log_acked_write(ack_log, 0);
+    let value2 = format!("flush2:{seed}").into_bytes();
+    db.put(b"b", &value2).expect("put flush 2");
+    log_acked_write(ack_log, 1);
 }
 
 fn run_compaction_scenario(db: &DB, seed: u64, ack_log: &mut std::fs::File) {
+    let v1 = format!("c1:{seed}").into_bytes();
+    let v2 = format!("c2:{seed}").into_bytes();
+    let v3 = format!("c3:{seed}").into_bytes();
+    db.put(b"a", &v1).expect("put 1");
+    log_acked_write(ack_log, 0);
+    db.put(b"b", &v2).expect("put 2");
+    log_acked_write(ack_log, 1);
+    db.put(b"c", &v3).expect("put 3");
+    log_acked_write(ack_log, 2);
+}
+
+fn run_ioerr_flush_scenario(db: &DB, seed: u64, ack_log: &mut std::fs::File) {
+    let value = format!("flush:{seed}").into_bytes();
+    db.put(b"a", &value).expect("put a");
+    log_acked_write(ack_log, 0);
+    let err = db.put(b"b", b"2").is_err();
+    if !err {
+        panic!("expected io error");
+    }
+}
+
+fn run_ioerr_compaction_scenario(db: &DB, seed: u64, ack_log: &mut std::fs::File) {
     let v1 = format!("c1:{seed}").into_bytes();
     let v2 = format!("c2:{seed}").into_bytes();
     db.put(b"a", &v1).expect("put 1");
     log_acked_write(ack_log, 0);
     db.put(b"b", &v2).expect("put 2");
     log_acked_write(ack_log, 1);
+    let err = db.put(b"c", b"3").is_err();
+    if !err {
+        panic!("expected io error");
+    }
 }
 
 fn log_acked_write(ack_log: &mut std::fs::File, write_idx: u64) {

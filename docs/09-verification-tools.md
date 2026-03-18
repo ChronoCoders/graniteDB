@@ -55,6 +55,10 @@ Run:
 cargo test --test crash -- --nocapture
 ```
 
+## 9.7 IO Fault Injection
+
+GraniteDB supports injected IO errors at persistence boundaries via failpoints. See `10-io-fault-simulation.md`.
+
 ## 9.7 Model Checking (Later)
 
 loom is reserved for exploring concurrency interleavings after the single-writer design is proven correct.
