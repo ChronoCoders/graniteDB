@@ -1,19 +1,12 @@
 use std::collections::BTreeMap;
 use std::ops::Bound;
 
-use crate::error::Result;
 use crate::internal_key::{InternalKey, ValueType};
 
 #[derive(Clone, Debug, Default)]
 pub struct MemTable {
     map: BTreeMap<InternalKey, Vec<u8>>,
     approx_bytes: usize,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum GetDecision {
-    Value(Vec<u8>),
-    Deleted,
 }
 
 impl MemTable {
@@ -27,13 +20,14 @@ impl MemTable {
         self.map.insert(key, value);
     }
 
-    pub fn get_with_seq(
+    pub fn entries_for_user_key(
         &self,
         user_key: &[u8],
         read_seq: u64,
-    ) -> Result<Option<(u64, GetDecision)>> {
+    ) -> Vec<(u64, ValueType, Vec<u8>)> {
         let start = InternalKey::new(user_key.to_vec(), u64::MAX, ValueType::Tombstone);
         let it = self.map.range((Bound::Included(start), Bound::Unbounded));
+        let mut out = Vec::new();
         for (k, v) in it {
             if k.user_key() != user_key {
                 break;
@@ -41,13 +35,12 @@ impl MemTable {
             if k.seq() > read_seq {
                 continue;
             }
-            match k.value_type() {
-                ValueType::Value => return Ok(Some((k.seq(), GetDecision::Value(v.clone())))),
-                ValueType::Tombstone => return Ok(Some((k.seq(), GetDecision::Deleted))),
-                ValueType::RangeTombstone => continue,
+            if k.value_type() == ValueType::RangeTombstone {
+                continue;
             }
+            out.push((k.seq(), k.value_type(), v.clone()));
         }
-        Ok(None)
+        out
     }
 
     pub fn max_range_tombstone_seq_covering(&self, user_key: &[u8], read_seq: u64) -> Option<u64> {
@@ -107,13 +100,9 @@ mod tests {
         let mut mt = MemTable::default();
         mt.insert(b"a", 1, ValueType::Value, b"va".to_vec());
         mt.insert(b"ab", 2, ValueType::Value, b"vab".to_vec());
-        assert_eq!(
-            mt.get_with_seq(b"a", u64::MAX).unwrap().map(|(_s, d)| d),
-            Some(GetDecision::Value(b"va".to_vec()))
-        );
-        assert_eq!(
-            mt.get_with_seq(b"ab", u64::MAX).unwrap().map(|(_s, d)| d),
-            Some(GetDecision::Value(b"vab".to_vec()))
-        );
+        let a = mt.entries_for_user_key(b"a", u64::MAX);
+        assert_eq!(a, vec![(1, ValueType::Value, b"va".to_vec())]);
+        let ab = mt.entries_for_user_key(b"ab", u64::MAX);
+        assert_eq!(ab, vec![(2, ValueType::Value, b"vab".to_vec())]);
     }
 }

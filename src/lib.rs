@@ -11,6 +11,7 @@ mod manifest;
 #[cfg(feature = "loom")]
 pub mod memdb;
 mod memtable;
+mod merge;
 mod options;
 mod sstable;
 pub mod sync;
@@ -23,6 +24,7 @@ pub use crate::db::{
     Range, ReadOptions, Snapshot, Transaction, WriteOptions,
 };
 pub use crate::error::{GraniteError, Result};
+pub use crate::merge::{AppendMergeOperator, MergeOperator};
 pub use crate::options::{Compression, Options, SyncMode};
 pub use crate::sstable::{BlockCache, TableReader};
 pub use crate::write_batch::{WriteBatch, WriteOp};

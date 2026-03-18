@@ -16,6 +16,11 @@ pub enum WriteOp {
         start: Vec<u8>,
         end: Vec<u8>,
     },
+    Merge {
+        cf_id: u32,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    },
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -86,6 +91,29 @@ impl WriteBatch {
         self
     }
 
+    pub fn merge(mut self, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> Self {
+        self.ops.push(WriteOp::Merge {
+            cf_id: 0,
+            key: key.into(),
+            value: value.into(),
+        });
+        self
+    }
+
+    pub fn merge_cf(
+        mut self,
+        cf_id: u32,
+        key: impl Into<Vec<u8>>,
+        value: impl Into<Vec<u8>>,
+    ) -> Self {
+        self.ops.push(WriteOp::Merge {
+            cf_id,
+            key: key.into(),
+            value: value.into(),
+        });
+        self
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&(self.ops.len() as u32).to_le_bytes());
@@ -112,6 +140,14 @@ impl WriteBatch {
                     out.extend_from_slice(start);
                     out.extend_from_slice(&(end.len() as u32).to_le_bytes());
                     out.extend_from_slice(end);
+                }
+                WriteOp::Merge { cf_id, key, value } => {
+                    out.push(6u8);
+                    out.extend_from_slice(&cf_id.to_le_bytes());
+                    out.extend_from_slice(&(key.len() as u32).to_le_bytes());
+                    out.extend_from_slice(key);
+                    out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+                    out.extend_from_slice(value);
                 }
             }
         }
@@ -153,6 +189,12 @@ impl WriteBatch {
                     let start = read_bytes(&mut bytes)?;
                     let end = read_bytes(&mut bytes)?;
                     ops.push(WriteOp::DeleteRange { cf_id, start, end });
+                }
+                6 => {
+                    let cf_id = read_u32(&mut bytes)?;
+                    let key = read_bytes(&mut bytes)?;
+                    let value = read_bytes(&mut bytes)?;
+                    ops.push(WriteOp::Merge { cf_id, key, value });
                 }
                 _ => return Err(GraniteError::Corrupt("unknown op type")),
             }
@@ -208,7 +250,9 @@ mod tests {
             .put_cf(7, b"k".to_vec(), b"v".to_vec())
             .delete_cf(7, b"k".to_vec())
             .delete_range(b"c".to_vec(), b"d".to_vec())
-            .delete_range_cf(7, b"e".to_vec(), b"f".to_vec());
+            .delete_range_cf(7, b"e".to_vec(), b"f".to_vec())
+            .merge(b"m".to_vec(), b"1".to_vec())
+            .merge_cf(7, b"m".to_vec(), b"2".to_vec());
         let enc = batch.encode();
         let dec = WriteBatch::decode(&enc).unwrap();
         assert_eq!(batch, dec);

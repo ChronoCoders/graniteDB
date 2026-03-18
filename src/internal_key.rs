@@ -10,6 +10,7 @@ pub enum ValueType {
     Tombstone = 0,
     Value = 1,
     RangeTombstone = 2,
+    MergeOperand = 3,
 }
 
 impl ValueType {
@@ -18,6 +19,7 @@ impl ValueType {
             0 => Some(Self::Tombstone),
             1 => Some(Self::Value),
             2 => Some(Self::RangeTombstone),
+            3 => Some(Self::MergeOperand),
             _ => None,
         }
     }

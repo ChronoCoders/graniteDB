@@ -1,5 +1,5 @@
 use crate::error::{GraniteError, Result};
-use crate::memtable::{GetDecision, MemTable};
+use crate::memtable::MemTable;
 use crate::sync::Mutex;
 use crate::write_batch::{WriteBatch, WriteOp};
 
@@ -37,12 +37,17 @@ impl MemDb {
             .inner
             .lock()
             .map_err(|_| GraniteError::Corrupt("poisoned"))?;
-        Ok(g.memtable
-            .get_with_seq(key, u64::MAX)?
-            .and_then(|(_seq, d)| match d {
-                GetDecision::Value(v) => Some(v),
-                GetDecision::Deleted => None,
-            }))
+        let mut entries = g.memtable.entries_for_user_key(key, u64::MAX);
+        entries.sort_by(|a, b| b.0.cmp(&a.0));
+        for (_seq, vt, v) in entries {
+            match vt {
+                crate::internal_key::ValueType::Value => return Ok(Some(v)),
+                crate::internal_key::ValueType::Tombstone => return Ok(None),
+                crate::internal_key::ValueType::RangeTombstone => continue,
+                crate::internal_key::ValueType::MergeOperand => continue,
+            }
+        }
+        Ok(None)
     }
 
     fn write_batch(&self, batch: WriteBatch) -> Result<()> {
@@ -76,6 +81,14 @@ impl MemDb {
                         seq,
                         crate::internal_key::ValueType::RangeTombstone,
                         end.clone(),
+                    );
+                }
+                WriteOp::Merge { key, value, .. } => {
+                    g.memtable.insert(
+                        key,
+                        seq,
+                        crate::internal_key::ValueType::MergeOperand,
+                        value.clone(),
                     );
                 }
             }

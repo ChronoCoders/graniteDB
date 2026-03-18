@@ -433,41 +433,6 @@ impl TableReader {
         })
     }
 
-    pub fn get_by_seek_key_prefix(
-        &mut self,
-        seek_internal_key: &[u8],
-        user_key: &[u8],
-        read_seq: u64,
-        mut decide: impl FnMut(u8, &[u8]) -> Option<crate::memtable::GetDecision>,
-    ) -> Result<Option<crate::memtable::GetDecision>> {
-        if let Some(filter) = &self.filter
-            && !filter.may_contain(user_key)
-        {
-            return Ok(None);
-        }
-        let start_block = self.find_block(seek_internal_key);
-        for block_idx in start_block..self.index.len() {
-            let entries = self.read_block_entries(block_idx)?;
-            for (k, v) in entries {
-                let parsed = crate::internal_key::parse_internal_key(&k)?;
-                if parsed.user_key < user_key {
-                    continue;
-                }
-                if parsed.user_key > user_key {
-                    return Ok(None);
-                }
-                if parsed.seq > read_seq {
-                    continue;
-                }
-                let vt = parsed.value_type as u8;
-                if let Some(d) = decide(vt, &v) {
-                    return Ok(Some(d));
-                }
-            }
-        }
-        Ok(None)
-    }
-
     pub fn get_latest_for_user_key(
         &mut self,
         user_key: &[u8],
@@ -501,6 +466,42 @@ impl TableReader {
             }
         }
         Ok(None)
+    }
+
+    pub fn entries_for_user_key(
+        &mut self,
+        user_key: &[u8],
+        read_seq: u64,
+    ) -> Result<Vec<(u64, ValueType, Vec<u8>)>> {
+        if let Some(filter) = &self.filter
+            && !filter.may_contain(user_key)
+        {
+            return Ok(Vec::new());
+        }
+        let seek =
+            crate::internal_key::encode_internal_key(user_key, u64::MAX, ValueType::Tombstone);
+        let start_block = self.find_block(&seek);
+        let mut out = Vec::new();
+        for block_idx in start_block..self.index.len() {
+            let entries = self.read_block_entries(block_idx)?;
+            for (k, v) in entries {
+                let parsed = crate::internal_key::parse_internal_key(&k)?;
+                if parsed.user_key < user_key {
+                    continue;
+                }
+                if parsed.user_key > user_key {
+                    return Ok(out);
+                }
+                if parsed.seq > read_seq {
+                    continue;
+                }
+                if parsed.value_type == ValueType::RangeTombstone {
+                    continue;
+                }
+                out.push((parsed.seq, parsed.value_type, v));
+            }
+        }
+        Ok(out)
     }
 
     pub fn max_range_tombstone_seq_covering(
@@ -700,7 +701,10 @@ fn decode_data_block_entries(mut bytes: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>
         }
         let parsed = parse_internal_key(&key)?;
         match parsed.value_type {
-            ValueType::Value | ValueType::Tombstone | ValueType::RangeTombstone => {}
+            ValueType::Value
+            | ValueType::Tombstone
+            | ValueType::RangeTombstone
+            | ValueType::MergeOperand => {}
         }
         if let Some(prev) = &prev_key
             && cmp_internal_key_bytes(prev, &key)?.is_gt()
@@ -816,7 +820,6 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::internal_key::{ValueType, encode_internal_key};
-    use crate::memtable::GetDecision;
 
     use super::*;
 
@@ -840,14 +843,11 @@ mod tests {
         assert!(meta.file_size > 0);
 
         let mut reader = TableReader::open_with_cache(&path, None).unwrap();
-        let seek = encode_internal_key(b"a", u64::MAX, ValueType::Tombstone);
         let got = reader
-            .get_by_seek_key_prefix(&seek, b"a", u64::MAX, |vt, v| match vt {
-                0 => Some(GetDecision::Deleted),
-                1 => Some(GetDecision::Value(v.to_vec())),
-                _ => None,
-            })
+            .get_latest_for_user_key(b"a", u64::MAX)
+            .unwrap()
             .unwrap();
-        assert_eq!(got, Some(GetDecision::Deleted));
+        assert_eq!(got.0, 2);
+        assert_eq!(got.1, ValueType::Tombstone);
     }
 }

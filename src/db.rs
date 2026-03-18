@@ -12,7 +12,7 @@ use crate::internal_key::{
     ValueType, cmp_internal_key_bytes_unchecked, encode_internal_key, parse_internal_key,
 };
 use crate::manifest::{Manifest, VersionSet};
-use crate::memtable::{GetDecision, MemTable};
+use crate::memtable::MemTable;
 use crate::options::{Options, SyncMode};
 use crate::sstable::{BlockCache, TableBuilder, TableReader};
 use crate::util::sync_parent_dir;
@@ -696,10 +696,8 @@ impl DB {
     }
 
     fn merge_cf_id(&self, cf_id: u32, key: &[u8], value: &[u8]) -> Result<()> {
-        let existing = self.get_cf_with_snapshot_id(cf_id, key, Snapshot { read_seq: u64::MAX })?;
-        let mut merged = existing.unwrap_or_default();
-        merged.extend_from_slice(value);
-        self.put_cf_id(cf_id, key, &merged)
+        let batch = WriteBatch::default().merge_cf(cf_id, key.to_vec(), value.to_vec());
+        self.write_batch_with_options(batch, WriteOptions::default())
     }
 
     fn write_batch_in_cf(&self, cf_id: u32, batch: WriteBatch) -> Result<()> {
@@ -765,6 +763,9 @@ impl DB {
                 }
                 WriteOp::DeleteRange { .. } => {
                     w.metrics.deletes = w.metrics.deletes.saturating_add(1);
+                }
+                WriteOp::Merge { .. } => {
+                    w.metrics.puts = w.metrics.puts.saturating_add(1);
                 }
             }
         }
@@ -859,6 +860,12 @@ impl DB {
                         key: start.clone(),
                     });
                 }
+                WriteOp::Merge { cf_id, key, .. } => {
+                    reads.insert(TxKey {
+                        cf_id: *cf_id,
+                        key: key.clone(),
+                    });
+                }
             }
         }
 
@@ -926,6 +933,9 @@ impl DB {
                 }
                 WriteOp::DeleteRange { .. } => {
                     w.metrics.deletes = w.metrics.deletes.saturating_add(1);
+                }
+                WriteOp::Merge { .. } => {
+                    w.metrics.puts = w.metrics.puts.saturating_add(1);
                 }
             }
         }
@@ -1077,6 +1087,77 @@ impl DB {
         Ok(max_seq)
     }
 
+    fn get_cf_with_snapshot_id_locked(
+        &self,
+        w: &WriterState,
+        cf_id: u32,
+        key: &[u8],
+        snapshot: Snapshot,
+    ) -> Result<Option<Vec<u8>>> {
+        let internal_key = encode_cf_user_key(cf_id, key);
+        let range_seq =
+            self.max_range_tombstone_seq_for_internal_key(w, &internal_key, snapshot.read_seq)?;
+
+        let mut entries: Vec<(u64, ValueType, Vec<u8>)> = Vec::new();
+        entries.extend(
+            w.memtable
+                .entries_for_user_key(&internal_key, snapshot.read_seq),
+        );
+        if let Some(imm) = w.imm_memtable.as_ref() {
+            entries.extend(imm.entries_for_user_key(&internal_key, snapshot.read_seq));
+        }
+        for meta in w.version.levels[0].iter().rev() {
+            let path = self.path.join(sst_file_name(meta.file_id));
+            let mut reader = TableReader::open_with_cache(path, Some(w.block_cache.clone()))?;
+            entries.extend(reader.entries_for_user_key(&internal_key, snapshot.read_seq)?);
+        }
+        for level in w.version.levels.iter().skip(1) {
+            for meta in level {
+                if !meta_may_contain_user_key(meta, &internal_key)? {
+                    continue;
+                }
+                let path = self.path.join(sst_file_name(meta.file_id));
+                let mut reader = TableReader::open_with_cache(path, Some(w.block_cache.clone()))?;
+                entries.extend(reader.entries_for_user_key(&internal_key, snapshot.read_seq)?);
+            }
+        }
+        entries.sort_by(|a, b| b.0.cmp(&a.0));
+
+        let mut operands: Vec<Vec<u8>> = Vec::new();
+        let mut base: Option<Option<Vec<u8>>> = None;
+
+        for (seq, vt, v) in entries {
+            if range_seq.is_some_and(|r| r >= seq) {
+                base = Some(None);
+                break;
+            }
+            match vt {
+                ValueType::Value => {
+                    base = Some(Some(v));
+                    break;
+                }
+                ValueType::Tombstone => {
+                    base = Some(None);
+                    break;
+                }
+                ValueType::MergeOperand => operands.push(v),
+                ValueType::RangeTombstone => {}
+            }
+        }
+
+        let existing = match &base {
+            Some(Some(v)) => Some(v.as_slice()),
+            _ => None,
+        };
+        if operands.is_empty() {
+            return Ok(existing.map(|v| v.to_vec()));
+        }
+        let operand_slices: Vec<&[u8]> = operands.iter().rev().map(|v| v.as_slice()).collect();
+        w.options
+            .merge_operator
+            .full_merge(key, existing, &operand_slices)
+    }
+
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.get_cf_with_snapshot_id(0, key, Snapshot { read_seq: u64::MAX })
     }
@@ -1126,41 +1207,7 @@ impl DB {
             .state
             .lock()
             .map_err(|_| GraniteError::Corrupt("poisoned"))?;
-        let key = encode_cf_user_key(cf_id, key);
-        let range_seq =
-            self.max_range_tombstone_seq_for_internal_key(&w, &key, snapshot.read_seq)?;
-
-        if let Some((seq, decision)) = w.memtable.get_with_seq(&key, snapshot.read_seq)? {
-            return Ok(apply_range_tombstone(decision, seq, range_seq));
-        }
-        if let Some(imm) = w.imm_memtable.as_ref()
-            && let Some((seq, decision)) = imm.get_with_seq(&key, snapshot.read_seq)?
-        {
-            return Ok(apply_range_tombstone(decision, seq, range_seq));
-        }
-
-        for meta in w.version.levels[0].iter().rev() {
-            let path = self.path.join(sst_file_name(meta.file_id));
-            let mut reader = TableReader::open_with_cache(path, Some(w.block_cache.clone()))?;
-            if let Some((seq, vt, v)) = reader.get_latest_for_user_key(&key, snapshot.read_seq)? {
-                return Ok(apply_range_tombstone_sst(vt, v, seq, range_seq));
-            }
-        }
-        for level in w.version.levels.iter().skip(1) {
-            for meta in level {
-                if !meta_may_contain_user_key(meta, &key)? {
-                    continue;
-                }
-                let path = self.path.join(sst_file_name(meta.file_id));
-                let mut reader = TableReader::open_with_cache(path, Some(w.block_cache.clone()))?;
-                if let Some((seq, vt, v)) =
-                    reader.get_latest_for_user_key(&key, snapshot.read_seq)?
-                {
-                    return Ok(apply_range_tombstone_sst(vt, v, seq, range_seq));
-                }
-            }
-        }
-        Ok(None)
+        self.get_cf_with_snapshot_id_locked(&w, cf_id, key, snapshot)
     }
 
     pub fn iter(&self, range: Range) -> Result<DbIterator> {
@@ -1205,42 +1252,6 @@ impl DB {
 
     pub fn path(&self) -> &Path {
         &self.path
-    }
-}
-
-fn apply_range_tombstone(
-    decision: GetDecision,
-    seq: u64,
-    range_seq: Option<u64>,
-) -> Option<Vec<u8>> {
-    match decision {
-        GetDecision::Value(v) => {
-            if range_seq.is_some_and(|r| r >= seq) {
-                None
-            } else {
-                Some(v)
-            }
-        }
-        GetDecision::Deleted => None,
-    }
-}
-
-fn apply_range_tombstone_sst(
-    value_type: ValueType,
-    value: Vec<u8>,
-    seq: u64,
-    range_seq: Option<u64>,
-) -> Option<Vec<u8>> {
-    match value_type {
-        ValueType::Value => {
-            if range_seq.is_some_and(|r| r >= seq) {
-                None
-            } else {
-                Some(value)
-            }
-        }
-        ValueType::Tombstone => None,
-        ValueType::RangeTombstone => None,
     }
 }
 
@@ -1414,6 +1425,15 @@ fn encoded_write_batch_len(batch: &WriteBatch) -> usize {
                     .saturating_add(start.len())
                     .saturating_add(4)
                     .saturating_add(end.len());
+            }
+            WriteOp::Merge { key, value, .. } => {
+                out = out
+                    .saturating_add(1)
+                    .saturating_add(4)
+                    .saturating_add(4)
+                    .saturating_add(key.len())
+                    .saturating_add(4)
+                    .saturating_add(value.len());
             }
         }
     }
@@ -1772,6 +1792,7 @@ fn compact_l0_to_l1(db_dir: &Path, w: &mut WriterState) -> Result<()> {
         if w.options.drop_obsolete_versions_during_compaction
             && kept_snapshot_version_for_user_key
             && value_type != ValueType::RangeTombstone
+            && value_type != ValueType::MergeOperand
         {
             let src = e.src;
             let next = sources[src].scanner.next_item()?;
@@ -1787,7 +1808,10 @@ fn compact_l0_to_l1(db_dir: &Path, w: &mut WriterState) -> Result<()> {
         }
 
         builder.add(&out_key, &out_value)?;
-        if w.options.drop_obsolete_versions_during_compaction && seq <= smallest_snapshot {
+        if w.options.drop_obsolete_versions_during_compaction
+            && seq <= smallest_snapshot
+            && matches!(value_type, ValueType::Value | ValueType::Tombstone)
+        {
             kept_snapshot_version_for_user_key = true;
         }
         let src = e.src;
@@ -2008,6 +2032,7 @@ fn compact_level_to_next(db_dir: &Path, w: &mut WriterState, level: usize) -> Re
         if w.options.drop_obsolete_versions_during_compaction
             && kept_snapshot_version_for_user_key
             && value_type != ValueType::RangeTombstone
+            && value_type != ValueType::MergeOperand
         {
             let src = e.src;
             let next = sources[src].scanner.next_item()?;
@@ -2023,7 +2048,10 @@ fn compact_level_to_next(db_dir: &Path, w: &mut WriterState, level: usize) -> Re
         }
 
         builder.add(&out_key, &out_value)?;
-        if w.options.drop_obsolete_versions_during_compaction && seq <= smallest_snapshot {
+        if w.options.drop_obsolete_versions_during_compaction
+            && seq <= smallest_snapshot
+            && matches!(value_type, ValueType::Value | ValueType::Tombstone)
+        {
             kept_snapshot_version_for_user_key = true;
         }
         let src = e.src;
@@ -2220,8 +2248,11 @@ fn collect_visible_items(
     }
 
     let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    let mut last_user_key: Option<Vec<u8>> = None;
     let mut active_range_tombstones: Vec<(Vec<u8>, u64)> = Vec::new();
+    let mut current_user_key: Option<Vec<u8>> = None;
+    let mut current_in_range = false;
+    let mut current_base: Option<Option<Vec<u8>>> = None;
+    let mut current_operands: Vec<Vec<u8>> = Vec::new();
 
     while let Some(Reverse(e)) = heap.pop() {
         let src = e.src;
@@ -2261,31 +2292,92 @@ fn collect_visible_items(
             continue;
         }
 
-        if !user_key_in_range(user_key, range) {
-            continue;
-        }
-        if last_user_key
+        let is_new_key = current_user_key
             .as_ref()
-            .is_some_and(|prev| prev.as_slice() == user_key)
-        {
+            .is_none_or(|k| k.as_slice() != user_key);
+        if is_new_key {
+            if let Some(k) = current_user_key.take()
+                && current_in_range
+            {
+                if current_operands.is_empty() {
+                    if let Some(Some(v)) = current_base.take() {
+                        out.push((k, v));
+                    }
+                } else {
+                    let existing = match &current_base {
+                        Some(Some(v)) => Some(v.as_slice()),
+                        _ => None,
+                    };
+                    let operand_slices: Vec<&[u8]> = current_operands
+                        .iter()
+                        .rev()
+                        .map(|v| v.as_slice())
+                        .collect();
+                    if let Some(v) =
+                        w.options
+                            .merge_operator
+                            .full_merge(&k, existing, &operand_slices)?
+                    {
+                        out.push((k, v));
+                    }
+                }
+            }
+            current_user_key = Some(user_key.to_vec());
+            current_in_range = user_key_in_range(user_key, range);
+            current_base = None;
+            current_operands.clear();
+        }
+
+        if !current_in_range {
             continue;
         }
-        last_user_key = Some(user_key.to_vec());
 
         let range_seq = active_range_tombstones
             .iter()
             .filter_map(|(end, seq)| (user_key < end.as_slice()).then_some(*seq))
             .max();
 
+        if current_base.is_some() {
+            continue;
+        }
+
+        if range_seq.is_some_and(|r| r >= parsed.seq) {
+            current_base = Some(None);
+            continue;
+        }
+
         match parsed.value_type {
-            ValueType::Value => {
-                if range_seq.is_some_and(|r| r >= parsed.seq) {
-                    continue;
-                }
-                out.push((user_key.to_vec(), e.value));
-            }
-            ValueType::Tombstone => {}
+            ValueType::Value => current_base = Some(Some(e.value)),
+            ValueType::Tombstone => current_base = Some(None),
+            ValueType::MergeOperand => current_operands.push(e.value),
             ValueType::RangeTombstone => {}
+        }
+    }
+
+    if let Some(k) = current_user_key.take()
+        && current_in_range
+    {
+        if current_operands.is_empty() {
+            if let Some(Some(v)) = current_base.take() {
+                out.push((k, v));
+            }
+        } else {
+            let existing = match &current_base {
+                Some(Some(v)) => Some(v.as_slice()),
+                _ => None,
+            };
+            let operand_slices: Vec<&[u8]> = current_operands
+                .iter()
+                .rev()
+                .map(|v| v.as_slice())
+                .collect();
+            if let Some(v) = w
+                .options
+                .merge_operator
+                .full_merge(&k, existing, &operand_slices)?
+            {
+                out.push((k, v));
+            }
         }
     }
 
@@ -2368,6 +2460,11 @@ fn set_batch_cf_id(cf_id: u32, batch: WriteBatch) -> WriteBatch {
                 start,
                 end,
             } => WriteOp::DeleteRange { cf_id, start, end },
+            WriteOp::Merge {
+                cf_id: _,
+                key,
+                value,
+            } => WriteOp::Merge { cf_id, key, value },
         })
         .collect();
     WriteBatch { ops }
@@ -2418,6 +2515,10 @@ fn apply_batch_to_memtable_at_seq(memtable: &mut MemTable, batch: &WriteBatch, s
                 let start_k = encode_cf_user_key(*cf_id, start);
                 let end_k = encode_cf_user_key(*cf_id, end);
                 memtable.insert(&start_k, seq, ValueType::RangeTombstone, end_k);
+            }
+            WriteOp::Merge { cf_id, key, value } => {
+                let k = encode_cf_user_key(*cf_id, key);
+                memtable.insert(&k, seq, ValueType::MergeOperand, value.clone());
             }
         }
         seq = seq.saturating_add(1);
