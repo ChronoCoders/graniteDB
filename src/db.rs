@@ -13,7 +13,7 @@ use crate::internal_key::{
 };
 use crate::manifest::{Manifest, VersionSet};
 use crate::memtable::MemTable;
-use crate::options::{Options, SyncMode};
+use crate::options::{CompactionStyle, Options, SyncMode};
 use crate::sstable::{BlockCache, TableBuilder, TableReader};
 use crate::util::sync_parent_dir;
 use crate::wal::Wal;
@@ -1655,6 +1655,12 @@ fn bg_worker(db_dir: PathBuf, shared: Arc<Shared>) {
 }
 
 fn compaction_needed(w: &WriterState) -> bool {
+    if w.options.compaction_style == CompactionStyle::Fifo && w.options.fifo_l0_max_bytes > 0 {
+        let l0_bytes: u64 = w.version.levels[0].iter().map(|m| m.file_size).sum();
+        if l0_bytes > w.options.fifo_l0_max_bytes {
+            return true;
+        }
+    }
     if w.version.levels[0].len() > w.options.l0_slowdown_trigger {
         return true;
     }
@@ -1927,6 +1933,11 @@ fn maybe_compact_levels(db_dir: &Path, w: &mut WriterState) -> Result<()> {
         w.version.levels.resize_with(max_levels, Vec::new);
     }
 
+    if w.options.compaction_style == CompactionStyle::Fifo {
+        fifo_compact_l0(db_dir, w)?;
+        return Ok(());
+    }
+
     let mut steps = 0usize;
     let max_steps = max_levels.saturating_mul(4).max(8);
     loop {
@@ -1964,6 +1975,40 @@ fn maybe_compact_levels(db_dir: &Path, w: &mut WriterState) -> Result<()> {
         } else {
             return Ok(());
         }
+    }
+}
+
+fn fifo_compact_l0(db_dir: &Path, w: &mut WriterState) -> Result<()> {
+    let max_bytes = w.options.fifo_l0_max_bytes;
+    if max_bytes == 0 {
+        return Ok(());
+    }
+    loop {
+        let l0_bytes: u64 = w.version.levels[0].iter().map(|m| m.file_size).sum();
+        if l0_bytes <= max_bytes {
+            return Ok(());
+        }
+        if w.version.levels[0].is_empty() {
+            return Ok(());
+        }
+        let (idx, file_id) = w.version.levels[0]
+            .iter()
+            .enumerate()
+            .min_by_key(|(_i, m)| m.file_id)
+            .map(|(i, m)| (i, m.file_id))
+            .ok_or(GraniteError::Corrupt("missing l0 file"))?;
+
+        let last_sequence = w.next_seq.saturating_sub(1);
+        failpoint::io_err("compaction:before_manifest_edit")?;
+        failpoint::hit("compaction:before_manifest_edit");
+        w.manifest
+            .append_delete_files_edit(&[(0u32, file_id)], last_sequence)?;
+        failpoint::io_err("compaction:after_manifest_edit")?;
+        failpoint::hit("compaction:after_manifest_edit");
+        w.version.last_sequence = w.version.last_sequence.max(last_sequence);
+
+        w.version.levels[0].remove(idx);
+        let _ = fs::remove_file(db_dir.join(sst_file_name(file_id)));
     }
 }
 
@@ -2719,6 +2764,48 @@ mod tests {
         assert_eq!(db2.get(b"a").unwrap(), Some(b"1".to_vec()));
         let items: Vec<(Vec<u8>, Vec<u8>)> = db2.iter(Range::all()).unwrap().collect();
         assert_eq!(items, vec![(b"a".to_vec(), b"1".to_vec())]);
+    }
+
+    #[test]
+    fn fifo_compaction_drops_oldest_l0_files_when_over_limit() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("db");
+        let opts = Options {
+            sync: SyncMode::No,
+            memtable_max_bytes: 1,
+            compaction_style: CompactionStyle::Fifo,
+            fifo_l0_max_bytes: 200,
+            l0_slowdown_trigger: 1000,
+            l0_stop_trigger: 2000,
+            max_levels: 2,
+            ..Options::default()
+        };
+
+        let db = DB::open(&path, opts).unwrap();
+        for i in 0..10u8 {
+            let k = [b'k', i];
+            db.put(&k, &[b'x'; 80]).unwrap();
+        }
+
+        for _ in 0..500 {
+            let w = db.shared.state.lock().unwrap();
+            let l0_bytes: u64 = w.version.levels[0].iter().map(|m| m.file_size).sum();
+            if l0_bytes <= 200 && w.version.levels[0].len() <= 3 {
+                break;
+            }
+            drop(w);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let w = db.shared.state.lock().unwrap();
+        let l0_bytes: u64 = w.version.levels[0].iter().map(|m| m.file_size).sum();
+        assert!(l0_bytes <= 200);
+        assert!(w.version.levels[0].len() <= 3);
+        drop(w);
+
+        assert_eq!(db.get(b"k\x00").unwrap(), None);
+        assert_eq!(db.get(b"k\x09").unwrap(), Some(vec![b'x'; 80]));
+        db.close().unwrap();
     }
 
     #[test]

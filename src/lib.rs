@@ -25,7 +25,7 @@ pub use crate::db::{
 };
 pub use crate::error::{GraniteError, Result};
 pub use crate::merge::{AppendMergeOperator, MergeOperator};
-pub use crate::options::{Compression, Options, SyncMode};
+pub use crate::options::{CompactionStyle, Compression, Options, SyncMode};
 pub use crate::sstable::{BlockCache, TableReader};
 pub use crate::write_batch::{WriteBatch, WriteOp};
 

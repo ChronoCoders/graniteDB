@@ -10,6 +10,12 @@ pub enum Compression {
     Lz4,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompactionStyle {
+    Leveled,
+    Fifo,
+}
+
 #[derive(Clone)]
 pub struct Options {
     pub sync: SyncMode,
@@ -19,6 +25,8 @@ pub struct Options {
     pub max_levels: usize,
     pub level1_target_bytes: u64,
     pub level_multiplier: u64,
+    pub compaction_style: CompactionStyle,
+    pub fifo_l0_max_bytes: u64,
     pub bloom_bits_per_key: u8,
     pub sstable_compression: Compression,
     pub merge_operator: std::sync::Arc<dyn crate::merge::MergeOperator>,
@@ -40,6 +48,8 @@ impl std::fmt::Debug for Options {
             .field("max_levels", &self.max_levels)
             .field("level1_target_bytes", &self.level1_target_bytes)
             .field("level_multiplier", &self.level_multiplier)
+            .field("compaction_style", &self.compaction_style)
+            .field("fifo_l0_max_bytes", &self.fifo_l0_max_bytes)
             .field("bloom_bits_per_key", &self.bloom_bits_per_key)
             .field("sstable_compression", &self.sstable_compression)
             .field("max_write_bytes_per_sec", &self.max_write_bytes_per_sec)
@@ -74,6 +84,8 @@ impl Default for Options {
             max_levels: 4,
             level1_target_bytes: 4 * 1024 * 1024,
             level_multiplier: 10,
+            compaction_style: CompactionStyle::Leveled,
+            fifo_l0_max_bytes: 0,
             bloom_bits_per_key: 10,
             sstable_compression: Compression::None,
             merge_operator: crate::merge::default_merge_operator(),
