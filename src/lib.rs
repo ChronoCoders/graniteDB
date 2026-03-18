@@ -23,7 +23,7 @@ pub use crate::db::{
     ReadOptions, Snapshot, WriteOptions,
 };
 pub use crate::error::{GraniteError, Result};
-pub use crate::options::{Options, SyncMode};
+pub use crate::options::{Compression, Options, SyncMode};
 pub use crate::sstable::{BlockCache, TableReader};
 pub use crate::write_batch::{WriteBatch, WriteOp};
 

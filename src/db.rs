@@ -838,6 +838,7 @@ fn bg_worker(db_dir: PathBuf, shared: Arc<Shared>) {
                     w.next_seq.saturating_sub(1),
                     w.options.sync == SyncMode::Yes,
                     w.options.bloom_bits_per_key,
+                    w.options.sstable_compression,
                     w.imm_trigger_op_index,
                 ))
             } else {
@@ -855,6 +856,7 @@ fn bg_worker(db_dir: PathBuf, shared: Arc<Shared>) {
             last_sequence,
             sync,
             bloom_bits_per_key,
+            compression,
             op_index,
         )) = flush_task
         {
@@ -863,7 +865,7 @@ fn bg_worker(db_dir: PathBuf, shared: Arc<Shared>) {
             let final_path = db_dir.join(sst_file_name(file_id));
 
             let flush_res = (|| -> Result<crate::sstable::FileMeta> {
-                let mut builder = TableBuilder::create(&tmp_path, bloom_bits_per_key)?;
+                let mut builder = TableBuilder::create(&tmp_path, bloom_bits_per_key, compression)?;
                 for (user_key, seq, value_type, value) in imm.iter_user_entries() {
                     let ik = encode_internal_key(user_key, seq, value_type);
                     builder.add(&ik, value)?;
@@ -1095,7 +1097,11 @@ fn compact_l0_to_l1(db_dir: &Path, w: &mut WriterState) -> Result<()> {
         }
     }
 
-    let mut builder = TableBuilder::create(&tmp_path, w.options.bloom_bits_per_key)?;
+    let mut builder = TableBuilder::create(
+        &tmp_path,
+        w.options.bloom_bits_per_key,
+        w.options.sstable_compression,
+    )?;
     let now_micros = now_micros();
     let smallest_snapshot = u64::MAX;
     let mut current_user_key: Option<Vec<u8>> = None;
@@ -1325,7 +1331,11 @@ fn compact_level_to_next(db_dir: &Path, w: &mut WriterState, level: usize) -> Re
         }
     }
 
-    let mut builder = TableBuilder::create(&tmp_path, w.options.bloom_bits_per_key)?;
+    let mut builder = TableBuilder::create(
+        &tmp_path,
+        w.options.bloom_bits_per_key,
+        w.options.sstable_compression,
+    )?;
     let now_micros = now_micros();
     let smallest_snapshot = u64::MAX;
     let mut current_user_key: Option<Vec<u8>> = None;

@@ -4,6 +4,12 @@ pub enum SyncMode {
     No,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Compression {
+    None,
+    Lz4,
+}
+
 #[derive(Clone, Debug)]
 pub struct Options {
     pub sync: SyncMode,
@@ -14,6 +20,7 @@ pub struct Options {
     pub level1_target_bytes: u64,
     pub level_multiplier: u64,
     pub bloom_bits_per_key: u8,
+    pub sstable_compression: Compression,
     pub block_cache_capacity_bytes: usize,
     pub event_log_capacity: usize,
     pub manifest_checkpoint_target_bytes: u64,
@@ -32,6 +39,7 @@ impl Default for Options {
             level1_target_bytes: 4 * 1024 * 1024,
             level_multiplier: 10,
             bloom_bits_per_key: 10,
+            sstable_compression: Compression::None,
             block_cache_capacity_bytes: 64 * 1024 * 1024,
             event_log_capacity: 256,
             manifest_checkpoint_target_bytes: 4 * 1024 * 1024,

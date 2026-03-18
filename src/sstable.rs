@@ -9,11 +9,14 @@ use crate::internal_key::{
     INTERNAL_KEY_SUFFIX_LEN, ValueType, cmp_internal_key_bytes, cmp_internal_key_bytes_unchecked,
     parse_internal_key,
 };
+use crate::options::Compression;
 
 const DATA_BLOCK_TARGET_BYTES: usize = 4 * 1024;
 const BLOCK_TRAILER_LEN: usize = 4 + 1;
 const FOOTER_LEN: usize = 8 * 4 + 8;
 const MAGIC_U64_LE: u64 = 0x4752_414E_4954_4531;
+const COMPRESSION_NONE: u8 = 0;
+const COMPRESSION_LZ4: u8 = 1;
 
 #[derive(Debug)]
 pub struct BlockCache {
@@ -221,10 +224,15 @@ pub struct TableBuilder {
     largest_key: Option<Vec<u8>>,
     bloom_hashes: Vec<u32>,
     bloom_bits_per_key: u8,
+    compression: Compression,
 }
 
 impl TableBuilder {
-    pub fn create(path: impl AsRef<Path>, bloom_bits_per_key: u8) -> Result<Self> {
+    pub fn create(
+        path: impl AsRef<Path>,
+        bloom_bits_per_key: u8,
+        compression: Compression,
+    ) -> Result<Self> {
         let file = OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -240,6 +248,7 @@ impl TableBuilder {
             largest_key: None,
             bloom_hashes: Vec::new(),
             bloom_bits_per_key,
+            compression,
         })
     }
 
@@ -323,11 +332,18 @@ impl TableBuilder {
 
     fn flush_data_block(&mut self) -> Result<()> {
         let block_offset = self.file.seek(SeekFrom::End(0))?;
-        failpoint::write_all("sst:write_data", &mut self.file, &self.data_block_buf)?;
-        let crc = crc32c::crc32c(&self.data_block_buf);
+        let (payload, compression) = match self.compression {
+            Compression::None => (self.data_block_buf.clone(), COMPRESSION_NONE),
+            Compression::Lz4 => (
+                lz4_flex::compress_prepend_size(&self.data_block_buf),
+                COMPRESSION_LZ4,
+            ),
+        };
+        failpoint::write_all("sst:write_data", &mut self.file, &payload)?;
+        let crc = crc32c::crc32c(&payload);
         failpoint::write_all("sst:write_trailer", &mut self.file, &crc.to_le_bytes())?;
-        failpoint::write_all("sst:write_trailer", &mut self.file, &[0u8])?;
-        let block_len = (self.data_block_buf.len() + BLOCK_TRAILER_LEN) as u32;
+        failpoint::write_all("sst:write_trailer", &mut self.file, &[compression])?;
+        let block_len = (payload.len() + BLOCK_TRAILER_LEN) as u32;
 
         let sep_key = self.data_block_last_key.clone();
         if sep_key.is_empty() {
@@ -405,7 +421,7 @@ impl TableReader {
         } else {
             let block = read_block_bytes(&mut file, filter_off, filter_len as u32)?;
             let payload = decode_block_payload(&block)?;
-            Some(decode_filter_block(payload)?)
+            Some(decode_filter_block(&payload)?)
         };
 
         Ok(Self {
@@ -495,7 +511,7 @@ impl TableReader {
             Arc::new(read_block_bytes(&mut self.file, key.offset, key.len)?)
         };
         let payload = decode_block_payload(block.as_slice())?;
-        decode_data_block_entries(payload)
+        decode_data_block_entries(&payload)
     }
 }
 
@@ -627,7 +643,7 @@ fn read_block_bytes(file: &mut File, offset: u64, len: u32) -> Result<Vec<u8>> {
     Ok(block)
 }
 
-fn decode_block_payload(block: &[u8]) -> Result<&[u8]> {
+fn decode_block_payload(block: &[u8]) -> Result<Vec<u8>> {
     if block.len() < BLOCK_TRAILER_LEN {
         return Err(GraniteError::Corrupt("block too short"));
     }
@@ -639,10 +655,12 @@ fn decode_block_payload(block: &[u8]) -> Result<&[u8]> {
         return Err(GraniteError::Corrupt("block checksum mismatch"));
     }
     let compression = block[payload_len + 4];
-    if compression != 0 {
-        return Err(GraniteError::InvalidArgument("compression not supported"));
+    match compression {
+        COMPRESSION_NONE => Ok(payload.to_vec()),
+        COMPRESSION_LZ4 => lz4_flex::decompress_size_prepended(payload)
+            .map_err(|_| GraniteError::Corrupt("lz4 decompress failed")),
+        _ => Err(GraniteError::Corrupt("unknown compression")),
     }
-    Ok(payload)
 }
 
 fn read_u32(bytes: &mut &[u8]) -> Result<u32> {
@@ -713,7 +731,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("000001.sst");
 
-        let mut builder = TableBuilder::create(&path, 10).unwrap();
+        let mut builder = TableBuilder::create(&path, 10, Compression::None).unwrap();
         builder
             .add(&encode_internal_key(b"a", 2, ValueType::Tombstone), b"")
             .unwrap();
