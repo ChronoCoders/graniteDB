@@ -36,11 +36,13 @@ const TAG_ADD_FILE: u8 = 1;
 const TAG_DELETE_FILE: u8 = 2;
 const TAG_SET_LOG_NUMBER: u8 = 3;
 const TAG_SET_LAST_SEQUENCE: u8 = 4;
+const TAG_SET_PREV_LOG_NUMBER: u8 = 5;
 
 #[derive(Clone, Debug)]
 pub struct VersionSet {
     pub levels: Vec<Vec<FileMeta>>,
     pub log_number: u64,
+    pub prev_log_number: u64,
     pub last_sequence: u64,
 }
 
@@ -64,6 +66,7 @@ impl Default for VersionSet {
         Self {
             levels: vec![Vec::new(), Vec::new()],
             log_number: 1,
+            prev_log_number: 0,
             last_sequence: 0,
         }
     }
@@ -123,12 +126,30 @@ impl Manifest {
     pub fn append_flush_edit(
         &mut self,
         meta: &FileMeta,
-        new_log_number: u64,
+        log_number: u64,
+        prev_log_number: u64,
         last_sequence: u64,
     ) -> Result<()> {
         let mut payload = Vec::new();
         encode_add_file(&mut payload, meta);
-        encode_set_log_number(&mut payload, new_log_number);
+        encode_set_log_number(&mut payload, log_number);
+        encode_set_prev_log_number(&mut payload, prev_log_number);
+        encode_set_last_sequence(&mut payload, last_sequence);
+        failpoint::hit("manifest:before_append");
+        self.append_logical_record(&payload)?;
+        failpoint::hit("manifest:after_append");
+        self.sync()
+    }
+
+    pub fn append_log_rotation_edit(
+        &mut self,
+        prev_log_number: u64,
+        log_number: u64,
+        last_sequence: u64,
+    ) -> Result<()> {
+        let mut payload = Vec::new();
+        encode_set_log_number(&mut payload, log_number);
+        encode_set_prev_log_number(&mut payload, prev_log_number);
         encode_set_last_sequence(&mut payload, last_sequence);
         failpoint::hit("manifest:before_append");
         self.append_logical_record(&payload)?;
@@ -261,6 +282,10 @@ fn apply_one_record(version: &mut VersionSet, mut rec: &[u8]) -> Result<()> {
                 let log_number = read_u64(&mut rec)?;
                 version.log_number = log_number;
             }
+            TAG_SET_PREV_LOG_NUMBER => {
+                let prev_log_number = read_u64(&mut rec)?;
+                version.prev_log_number = prev_log_number;
+            }
             TAG_SET_LAST_SEQUENCE => {
                 let last_sequence = read_u64(&mut rec)?;
                 version.last_sequence = version.last_sequence.max(last_sequence);
@@ -291,6 +316,11 @@ fn encode_delete_file(out: &mut Vec<u8>, level: u32, file_id: u64) {
 fn encode_set_log_number(out: &mut Vec<u8>, log_number: u64) {
     out.push(TAG_SET_LOG_NUMBER);
     out.extend_from_slice(&log_number.to_le_bytes());
+}
+
+fn encode_set_prev_log_number(out: &mut Vec<u8>, prev_log_number: u64) {
+    out.push(TAG_SET_PREV_LOG_NUMBER);
+    out.extend_from_slice(&prev_log_number.to_le_bytes());
 }
 
 fn encode_set_last_sequence(out: &mut Vec<u8>, last_sequence: u64) {
@@ -506,6 +536,7 @@ mod tests {
         let (mut m, v0) = Manifest::open(dir.path(), SyncMode::No).unwrap();
         assert!(v0.levels[0].is_empty());
         assert_eq!(v0.log_number, 1);
+        assert_eq!(v0.prev_log_number, 0);
         assert_eq!(v0.last_sequence, 0);
 
         let meta = FileMeta {
@@ -515,7 +546,7 @@ mod tests {
             smallest_key: b"a".to_vec(),
             largest_key: b"z".to_vec(),
         };
-        m.append_flush_edit(&meta, 2, 9).unwrap();
+        m.append_flush_edit(&meta, 2, 0, 9).unwrap();
         m.sync().unwrap();
 
         m.file.seek(SeekFrom::End(0)).unwrap();
@@ -526,6 +557,7 @@ mod tests {
         assert_eq!(v2.levels[0].len(), 1);
         assert_eq!(v2.levels[0][0].file_id, 7);
         assert_eq!(v2.log_number, 2);
+        assert_eq!(v2.prev_log_number, 0);
         assert_eq!(v2.last_sequence, 9);
     }
 }
