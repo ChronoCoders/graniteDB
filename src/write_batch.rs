@@ -11,6 +11,11 @@ pub enum WriteOp {
         cf_id: u32,
         key: Vec<u8>,
     },
+    DeleteRange {
+        cf_id: u32,
+        start: Vec<u8>,
+        end: Vec<u8>,
+    },
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -58,6 +63,29 @@ impl WriteBatch {
         self
     }
 
+    pub fn delete_range(mut self, start: impl Into<Vec<u8>>, end: impl Into<Vec<u8>>) -> Self {
+        self.ops.push(WriteOp::DeleteRange {
+            cf_id: 0,
+            start: start.into(),
+            end: end.into(),
+        });
+        self
+    }
+
+    pub fn delete_range_cf(
+        mut self,
+        cf_id: u32,
+        start: impl Into<Vec<u8>>,
+        end: impl Into<Vec<u8>>,
+    ) -> Self {
+        self.ops.push(WriteOp::DeleteRange {
+            cf_id,
+            start: start.into(),
+            end: end.into(),
+        });
+        self
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&(self.ops.len() as u32).to_le_bytes());
@@ -76,6 +104,14 @@ impl WriteBatch {
                     out.extend_from_slice(&cf_id.to_le_bytes());
                     out.extend_from_slice(&(key.len() as u32).to_le_bytes());
                     out.extend_from_slice(key);
+                }
+                WriteOp::DeleteRange { cf_id, start, end } => {
+                    out.push(5u8);
+                    out.extend_from_slice(&cf_id.to_le_bytes());
+                    out.extend_from_slice(&(start.len() as u32).to_le_bytes());
+                    out.extend_from_slice(start);
+                    out.extend_from_slice(&(end.len() as u32).to_le_bytes());
+                    out.extend_from_slice(end);
                 }
             }
         }
@@ -111,6 +147,12 @@ impl WriteBatch {
                     let cf_id = read_u32(&mut bytes)?;
                     let key = read_bytes(&mut bytes)?;
                     ops.push(WriteOp::Delete { cf_id, key });
+                }
+                5 => {
+                    let cf_id = read_u32(&mut bytes)?;
+                    let start = read_bytes(&mut bytes)?;
+                    let end = read_bytes(&mut bytes)?;
+                    ops.push(WriteOp::DeleteRange { cf_id, start, end });
                 }
                 _ => return Err(GraniteError::Corrupt("unknown op type")),
             }
@@ -164,7 +206,9 @@ mod tests {
             .put(b"a".to_vec(), b"1".to_vec())
             .delete(b"b".to_vec())
             .put_cf(7, b"k".to_vec(), b"v".to_vec())
-            .delete_cf(7, b"k".to_vec());
+            .delete_cf(7, b"k".to_vec())
+            .delete_range(b"c".to_vec(), b"d".to_vec())
+            .delete_range_cf(7, b"e".to_vec(), b"f".to_vec());
         let enc = batch.encode();
         let dec = WriteBatch::decode(&enc).unwrap();
         assert_eq!(batch, dec);

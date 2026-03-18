@@ -27,7 +27,11 @@ impl MemTable {
         self.map.insert(key, value);
     }
 
-    pub fn get(&self, user_key: &[u8], read_seq: u64) -> Result<Option<GetDecision>> {
+    pub fn get_with_seq(
+        &self,
+        user_key: &[u8],
+        read_seq: u64,
+    ) -> Result<Option<(u64, GetDecision)>> {
         let start = InternalKey::new(user_key.to_vec(), u64::MAX, ValueType::Tombstone);
         let it = self.map.range((Bound::Included(start), Bound::Unbounded));
         for (k, v) in it {
@@ -37,12 +41,39 @@ impl MemTable {
             if k.seq() > read_seq {
                 continue;
             }
-            return Ok(Some(match k.value_type() {
-                ValueType::Value => GetDecision::Value(v.clone()),
-                ValueType::Tombstone => GetDecision::Deleted,
-            }));
+            match k.value_type() {
+                ValueType::Value => return Ok(Some((k.seq(), GetDecision::Value(v.clone())))),
+                ValueType::Tombstone => return Ok(Some((k.seq(), GetDecision::Deleted))),
+                ValueType::RangeTombstone => continue,
+            }
         }
         Ok(None)
+    }
+
+    pub fn max_range_tombstone_seq_covering(&self, user_key: &[u8], read_seq: u64) -> Option<u64> {
+        if user_key.len() < 4 {
+            return None;
+        }
+        let prefix = &user_key[..4];
+        let start = InternalKey::new(prefix.to_vec(), u64::MAX, ValueType::RangeTombstone);
+        let end = InternalKey::new(user_key.to_vec(), 0, ValueType::RangeTombstone);
+        let it = self
+            .map
+            .range((Bound::Included(start), Bound::Included(end)));
+        let mut max_seq = None;
+        for (k, v) in it {
+            if k.seq() > read_seq {
+                continue;
+            }
+            if k.value_type() != ValueType::RangeTombstone {
+                continue;
+            }
+            if v.as_slice() <= user_key {
+                continue;
+            }
+            max_seq = Some(max_seq.unwrap_or(0).max(k.seq()));
+        }
+        max_seq
     }
 
     pub fn latest_seq(&self, user_key: &[u8]) -> Option<u64> {
@@ -77,11 +108,11 @@ mod tests {
         mt.insert(b"a", 1, ValueType::Value, b"va".to_vec());
         mt.insert(b"ab", 2, ValueType::Value, b"vab".to_vec());
         assert_eq!(
-            mt.get(b"a", u64::MAX).unwrap(),
+            mt.get_with_seq(b"a", u64::MAX).unwrap().map(|(_s, d)| d),
             Some(GetDecision::Value(b"va".to_vec()))
         );
         assert_eq!(
-            mt.get(b"ab", u64::MAX).unwrap(),
+            mt.get_with_seq(b"ab", u64::MAX).unwrap().map(|(_s, d)| d),
             Some(GetDecision::Value(b"vab".to_vec()))
         );
     }

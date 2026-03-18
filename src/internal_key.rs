@@ -9,6 +9,7 @@ pub const INTERNAL_KEY_SUFFIX_LEN: usize = 8 + 1;
 pub enum ValueType {
     Tombstone = 0,
     Value = 1,
+    RangeTombstone = 2,
 }
 
 impl ValueType {
@@ -16,6 +17,7 @@ impl ValueType {
         match v {
             0 => Some(Self::Tombstone),
             1 => Some(Self::Value),
+            2 => Some(Self::RangeTombstone),
             _ => None,
         }
     }

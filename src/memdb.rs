@@ -37,11 +37,12 @@ impl MemDb {
             .inner
             .lock()
             .map_err(|_| GraniteError::Corrupt("poisoned"))?;
-        match g.memtable.get(key, u64::MAX)? {
-            Some(GetDecision::Value(v)) => Ok(Some(v)),
-            Some(GetDecision::Deleted) => Ok(None),
-            None => Ok(None),
-        }
+        Ok(g.memtable
+            .get_with_seq(key, u64::MAX)?
+            .and_then(|(_seq, d)| match d {
+                GetDecision::Value(v) => Some(v),
+                GetDecision::Deleted => None,
+            }))
     }
 
     fn write_batch(&self, batch: WriteBatch) -> Result<()> {
@@ -67,6 +68,14 @@ impl MemDb {
                         seq,
                         crate::internal_key::ValueType::Tombstone,
                         Vec::new(),
+                    );
+                }
+                WriteOp::DeleteRange { start, end, .. } => {
+                    g.memtable.insert(
+                        start,
+                        seq,
+                        crate::internal_key::ValueType::RangeTombstone,
+                        end.clone(),
                     );
                 }
             }

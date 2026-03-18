@@ -468,6 +468,75 @@ impl TableReader {
         Ok(None)
     }
 
+    pub fn get_latest_for_user_key(
+        &mut self,
+        user_key: &[u8],
+        read_seq: u64,
+    ) -> Result<Option<(u64, ValueType, Vec<u8>)>> {
+        if let Some(filter) = &self.filter
+            && !filter.may_contain(user_key)
+        {
+            return Ok(None);
+        }
+        let seek =
+            crate::internal_key::encode_internal_key(user_key, u64::MAX, ValueType::Tombstone);
+        let start_block = self.find_block(&seek);
+        for block_idx in start_block..self.index.len() {
+            let entries = self.read_block_entries(block_idx)?;
+            for (k, v) in entries {
+                let parsed = crate::internal_key::parse_internal_key(&k)?;
+                if parsed.user_key < user_key {
+                    continue;
+                }
+                if parsed.user_key > user_key {
+                    return Ok(None);
+                }
+                if parsed.seq > read_seq {
+                    continue;
+                }
+                if parsed.value_type == ValueType::RangeTombstone {
+                    continue;
+                }
+                return Ok(Some((parsed.seq, parsed.value_type, v)));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn max_range_tombstone_seq_covering(
+        &mut self,
+        user_key: &[u8],
+        read_seq: u64,
+    ) -> Result<Option<u64>> {
+        if user_key.len() < 4 {
+            return Ok(None);
+        }
+        let prefix = &user_key[..4];
+        let seek = crate::internal_key::encode_internal_key(prefix, u64::MAX, ValueType::Tombstone);
+        let start_block = self.find_block(&seek);
+        let mut max_seq: Option<u64> = None;
+        for block_idx in start_block..self.index.len() {
+            let entries = self.read_block_entries(block_idx)?;
+            for (k, v) in entries {
+                let parsed = crate::internal_key::parse_internal_key(&k)?;
+                if parsed.user_key > user_key {
+                    return Ok(max_seq);
+                }
+                if parsed.seq > read_seq {
+                    continue;
+                }
+                if parsed.value_type != ValueType::RangeTombstone {
+                    continue;
+                }
+                if v.as_slice() <= user_key {
+                    continue;
+                }
+                max_seq = Some(max_seq.unwrap_or(0).max(parsed.seq));
+            }
+        }
+        Ok(max_seq)
+    }
+
     pub fn latest_seq(&mut self, user_key: &[u8]) -> Result<Option<u64>> {
         if let Some(filter) = &self.filter
             && !filter.may_contain(user_key)
@@ -631,7 +700,7 @@ fn decode_data_block_entries(mut bytes: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>
         }
         let parsed = parse_internal_key(&key)?;
         match parsed.value_type {
-            ValueType::Value | ValueType::Tombstone => {}
+            ValueType::Value | ValueType::Tombstone | ValueType::RangeTombstone => {}
         }
         if let Some(prev) = &prev_key
             && cmp_internal_key_bytes(prev, &key)?.is_gt()

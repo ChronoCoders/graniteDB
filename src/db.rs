@@ -676,15 +676,22 @@ impl DB {
     }
 
     fn delete_range_cf_id(&self, cf_id: u32, range: Range) -> Result<()> {
-        let snapshot = self.snapshot()?;
-        let keys: Vec<Vec<u8>> = self
-            .iter_cf_with_snapshot_id(cf_id, range, snapshot)?
-            .map(|(k, _v)| k)
-            .collect();
-        let mut batch = WriteBatch::default();
-        for k in keys {
-            batch = batch.delete_cf(cf_id, k);
+        let start = match &range.start {
+            Bound::Unbounded => return Err(GraniteError::InvalidArgument("unbounded range start")),
+            Bound::Included(k) => k.clone(),
+            Bound::Excluded(k) => successor_key(k.clone())
+                .ok_or(GraniteError::InvalidArgument("range start overflow"))?,
+        };
+        let end = match &range.end {
+            Bound::Unbounded => return Err(GraniteError::InvalidArgument("unbounded range end")),
+            Bound::Included(k) => successor_key(k.clone())
+                .ok_or(GraniteError::InvalidArgument("range end overflow"))?,
+            Bound::Excluded(k) => k.clone(),
+        };
+        if start >= end {
+            return Ok(());
         }
+        let batch = WriteBatch::default().delete_range_cf(cf_id, start, end);
         self.write_batch_with_options(batch, WriteOptions::default())
     }
 
@@ -754,6 +761,9 @@ impl DB {
                     w.metrics.puts = w.metrics.puts.saturating_add(1);
                 }
                 WriteOp::Delete { .. } => {
+                    w.metrics.deletes = w.metrics.deletes.saturating_add(1);
+                }
+                WriteOp::DeleteRange { .. } => {
                     w.metrics.deletes = w.metrics.deletes.saturating_add(1);
                 }
             }
@@ -843,6 +853,12 @@ impl DB {
                         key: key.clone(),
                     });
                 }
+                WriteOp::DeleteRange { cf_id, start, .. } => {
+                    reads.insert(TxKey {
+                        cf_id: *cf_id,
+                        key: start.clone(),
+                    });
+                }
             }
         }
 
@@ -906,6 +922,9 @@ impl DB {
                     w.metrics.puts = w.metrics.puts.saturating_add(1);
                 }
                 WriteOp::Delete { .. } => {
+                    w.metrics.deletes = w.metrics.deletes.saturating_add(1);
+                }
+                WriteOp::DeleteRange { .. } => {
                     w.metrics.deletes = w.metrics.deletes.saturating_add(1);
                 }
             }
@@ -1021,6 +1040,43 @@ impl DB {
         Ok(None)
     }
 
+    fn max_range_tombstone_seq_for_internal_key(
+        &self,
+        w: &WriterState,
+        internal_user_key: &[u8],
+        read_seq: u64,
+    ) -> Result<Option<u64>> {
+        let mut max_seq: Option<u64> = None;
+        if let Some(seq) = w
+            .memtable
+            .max_range_tombstone_seq_covering(internal_user_key, read_seq)
+        {
+            max_seq = Some(max_seq.unwrap_or(0).max(seq));
+        }
+        if let Some(imm) = w.imm_memtable.as_ref()
+            && let Some(seq) = imm.max_range_tombstone_seq_covering(internal_user_key, read_seq)
+        {
+            max_seq = Some(max_seq.unwrap_or(0).max(seq));
+        }
+
+        for level in &w.version.levels {
+            for meta in level {
+                let smallest = parse_internal_key(&meta.smallest_key)?.user_key;
+                if smallest > internal_user_key {
+                    continue;
+                }
+                let path = self.path.join(sst_file_name(meta.file_id));
+                let mut reader = TableReader::open_with_cache(path, Some(w.block_cache.clone()))?;
+                if let Some(seq) =
+                    reader.max_range_tombstone_seq_covering(internal_user_key, read_seq)?
+                {
+                    max_seq = Some(max_seq.unwrap_or(0).max(seq));
+                }
+            }
+        }
+        Ok(max_seq)
+    }
+
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.get_cf_with_snapshot_id(0, key, Snapshot { read_seq: u64::MAX })
     }
@@ -1071,68 +1127,40 @@ impl DB {
             .lock()
             .map_err(|_| GraniteError::Corrupt("poisoned"))?;
         let key = encode_cf_user_key(cf_id, key);
-        match w.memtable.get(&key, snapshot.read_seq)? {
-            Some(GetDecision::Value(v)) => Ok(Some(v)),
-            Some(GetDecision::Deleted) => Ok(None),
-            None => {
-                if let Some(imm) = w.imm_memtable.as_ref() {
-                    match imm.get(&key, snapshot.read_seq)? {
-                        Some(GetDecision::Value(v)) => return Ok(Some(v)),
-                        Some(GetDecision::Deleted) => return Ok(None),
-                        None => {}
-                    }
-                }
-                for meta in w.version.levels[0].iter().rev() {
-                    let path = self.path.join(sst_file_name(meta.file_id));
-                    let mut reader =
-                        TableReader::open_with_cache(path, Some(w.block_cache.clone()))?;
-                    let seek = encode_internal_key(&key, snapshot.read_seq, ValueType::Tombstone);
-                    let got = reader.get_by_seek_key_prefix(
-                        &seek,
-                        &key,
-                        snapshot.read_seq,
-                        |vt, v| match vt {
-                            0 => Some(GetDecision::Deleted),
-                            1 => Some(GetDecision::Value(v.to_vec())),
-                            _ => None,
-                        },
-                    )?;
-                    match got {
-                        Some(GetDecision::Value(v)) => return Ok(Some(v)),
-                        Some(GetDecision::Deleted) => return Ok(None),
-                        None => {}
-                    }
-                }
-                for level in w.version.levels.iter().skip(1) {
-                    for meta in level {
-                        if !meta_may_contain_user_key(meta, &key)? {
-                            continue;
-                        }
-                        let path = self.path.join(sst_file_name(meta.file_id));
-                        let mut reader =
-                            TableReader::open_with_cache(path, Some(w.block_cache.clone()))?;
-                        let seek =
-                            encode_internal_key(&key, snapshot.read_seq, ValueType::Tombstone);
-                        let got = reader.get_by_seek_key_prefix(
-                            &seek,
-                            &key,
-                            snapshot.read_seq,
-                            |vt, v| match vt {
-                                0 => Some(GetDecision::Deleted),
-                                1 => Some(GetDecision::Value(v.to_vec())),
-                                _ => None,
-                            },
-                        )?;
-                        match got {
-                            Some(GetDecision::Value(v)) => return Ok(Some(v)),
-                            Some(GetDecision::Deleted) => return Ok(None),
-                            None => {}
-                        }
-                    }
-                }
-                Ok(None)
+        let range_seq =
+            self.max_range_tombstone_seq_for_internal_key(&w, &key, snapshot.read_seq)?;
+
+        if let Some((seq, decision)) = w.memtable.get_with_seq(&key, snapshot.read_seq)? {
+            return Ok(apply_range_tombstone(decision, seq, range_seq));
+        }
+        if let Some(imm) = w.imm_memtable.as_ref()
+            && let Some((seq, decision)) = imm.get_with_seq(&key, snapshot.read_seq)?
+        {
+            return Ok(apply_range_tombstone(decision, seq, range_seq));
+        }
+
+        for meta in w.version.levels[0].iter().rev() {
+            let path = self.path.join(sst_file_name(meta.file_id));
+            let mut reader = TableReader::open_with_cache(path, Some(w.block_cache.clone()))?;
+            if let Some((seq, vt, v)) = reader.get_latest_for_user_key(&key, snapshot.read_seq)? {
+                return Ok(apply_range_tombstone_sst(vt, v, seq, range_seq));
             }
         }
+        for level in w.version.levels.iter().skip(1) {
+            for meta in level {
+                if !meta_may_contain_user_key(meta, &key)? {
+                    continue;
+                }
+                let path = self.path.join(sst_file_name(meta.file_id));
+                let mut reader = TableReader::open_with_cache(path, Some(w.block_cache.clone()))?;
+                if let Some((seq, vt, v)) =
+                    reader.get_latest_for_user_key(&key, snapshot.read_seq)?
+                {
+                    return Ok(apply_range_tombstone_sst(vt, v, seq, range_seq));
+                }
+            }
+        }
+        Ok(None)
     }
 
     pub fn iter(&self, range: Range) -> Result<DbIterator> {
@@ -1177,6 +1205,42 @@ impl DB {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+}
+
+fn apply_range_tombstone(
+    decision: GetDecision,
+    seq: u64,
+    range_seq: Option<u64>,
+) -> Option<Vec<u8>> {
+    match decision {
+        GetDecision::Value(v) => {
+            if range_seq.is_some_and(|r| r >= seq) {
+                None
+            } else {
+                Some(v)
+            }
+        }
+        GetDecision::Deleted => None,
+    }
+}
+
+fn apply_range_tombstone_sst(
+    value_type: ValueType,
+    value: Vec<u8>,
+    seq: u64,
+    range_seq: Option<u64>,
+) -> Option<Vec<u8>> {
+    match value_type {
+        ValueType::Value => {
+            if range_seq.is_some_and(|r| r >= seq) {
+                None
+            } else {
+                Some(value)
+            }
+        }
+        ValueType::Tombstone => None,
+        ValueType::RangeTombstone => None,
     }
 }
 
@@ -1341,6 +1405,15 @@ fn encoded_write_batch_len(batch: &WriteBatch) -> usize {
                     .saturating_add(4)
                     .saturating_add(4)
                     .saturating_add(key.len());
+            }
+            WriteOp::DeleteRange { start, end, .. } => {
+                out = out
+                    .saturating_add(1)
+                    .saturating_add(4)
+                    .saturating_add(4)
+                    .saturating_add(start.len())
+                    .saturating_add(4)
+                    .saturating_add(end.len());
             }
         }
     }
@@ -1696,7 +1769,9 @@ fn compact_l0_to_l1(db_dir: &Path, w: &mut WriterState) -> Result<()> {
             }
         }
 
-        if w.options.drop_obsolete_versions_during_compaction && kept_snapshot_version_for_user_key
+        if w.options.drop_obsolete_versions_during_compaction
+            && kept_snapshot_version_for_user_key
+            && value_type != ValueType::RangeTombstone
         {
             let src = e.src;
             let next = sources[src].scanner.next_item()?;
@@ -1930,7 +2005,9 @@ fn compact_level_to_next(db_dir: &Path, w: &mut WriterState, level: usize) -> Re
             }
         }
 
-        if w.options.drop_obsolete_versions_during_compaction && kept_snapshot_version_for_user_key
+        if w.options.drop_obsolete_versions_during_compaction
+            && kept_snapshot_version_for_user_key
+            && value_type != ValueType::RangeTombstone
         {
             let src = e.src;
             let next = sources[src].scanner.next_item()?;
@@ -2090,15 +2167,13 @@ fn collect_visible_items(
         });
     }
 
+    let seek_prefix = encode_internal_key(&cf_id.to_be_bytes(), u64::MAX, ValueType::Tombstone);
     for level in &w.version.levels {
         for meta in level {
             let path = db_dir.join(sst_file_name(meta.file_id));
             let reader = TableReader::open_with_cache(path, Some(w.block_cache.clone()))?;
             let mut it = reader.scanner();
-            let Some(seek) = range_start_seek_internal_key_for_cf(cf_id, range) else {
-                return Ok(Vec::new());
-            };
-            it.seek(&seek)?;
+            it.seek(&seek_prefix)?;
             let mut items = Vec::new();
             while let Some((k, v)) = it.next_item()? {
                 if internal_key_past_end_for_cf(&k, cf_id, range)? {
@@ -2146,6 +2221,7 @@ fn collect_visible_items(
 
     let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let mut last_user_key: Option<Vec<u8>> = None;
+    let mut active_range_tombstones: Vec<(Vec<u8>, u64)> = Vec::new();
 
     while let Some(Reverse(e)) = heap.pop() {
         let src = e.src;
@@ -2170,6 +2246,21 @@ fn collect_visible_items(
             }
             continue;
         }
+        active_range_tombstones.retain(|(end, _)| user_key < end.as_slice());
+
+        if parsed.value_type == ValueType::RangeTombstone {
+            let Ok((end_cf_id, end_user_key)) = split_cf_user_key(&e.value) else {
+                continue;
+            };
+            if end_cf_id != cf_id {
+                continue;
+            }
+            if end_user_key > user_key {
+                active_range_tombstones.push((end_user_key.to_vec(), parsed.seq));
+            }
+            continue;
+        }
+
         if !user_key_in_range(user_key, range) {
             continue;
         }
@@ -2181,9 +2272,20 @@ fn collect_visible_items(
         }
         last_user_key = Some(user_key.to_vec());
 
+        let range_seq = active_range_tombstones
+            .iter()
+            .filter_map(|(end, seq)| (user_key < end.as_slice()).then_some(*seq))
+            .max();
+
         match parsed.value_type {
-            ValueType::Value => out.push((user_key.to_vec(), e.value)),
+            ValueType::Value => {
+                if range_seq.is_some_and(|r| r >= parsed.seq) {
+                    continue;
+                }
+                out.push((user_key.to_vec(), e.value));
+            }
             ValueType::Tombstone => {}
+            ValueType::RangeTombstone => {}
         }
     }
 
@@ -2202,19 +2304,6 @@ fn user_key_in_range(user_key: &[u8], range: &Range) -> bool {
         _ => {}
     }
     true
-}
-
-fn range_start_seek_internal_key_for_cf(cf_id: u32, range: &Range) -> Option<Vec<u8>> {
-    let start_user_key = match &range.start {
-        Bound::Unbounded => Some(cf_id.to_be_bytes().to_vec()),
-        Bound::Included(k) => Some(encode_cf_user_key(cf_id, k)),
-        Bound::Excluded(k) => successor_key(encode_cf_user_key(cf_id, k)),
-    }?;
-    Some(encode_internal_key(
-        &start_user_key,
-        u64::MAX,
-        ValueType::Tombstone,
-    ))
 }
 
 fn successor_key(mut key: Vec<u8>) -> Option<Vec<u8>> {
@@ -2274,6 +2363,11 @@ fn set_batch_cf_id(cf_id: u32, batch: WriteBatch) -> WriteBatch {
                 value,
             } => WriteOp::Put { cf_id, key, value },
             WriteOp::Delete { cf_id: _, key } => WriteOp::Delete { cf_id, key },
+            WriteOp::DeleteRange {
+                cf_id: _,
+                start,
+                end,
+            } => WriteOp::DeleteRange { cf_id, start, end },
         })
         .collect();
     WriteBatch { ops }
@@ -2319,6 +2413,11 @@ fn apply_batch_to_memtable_at_seq(memtable: &mut MemTable, batch: &WriteBatch, s
             WriteOp::Delete { cf_id, key } => {
                 let k = encode_cf_user_key(*cf_id, key);
                 memtable.insert(&k, seq, ValueType::Tombstone, Vec::new());
+            }
+            WriteOp::DeleteRange { cf_id, start, end } => {
+                let start_k = encode_cf_user_key(*cf_id, start);
+                let end_k = encode_cf_user_key(*cf_id, end);
+                memtable.insert(&start_k, seq, ValueType::RangeTombstone, end_k);
             }
         }
         seq = seq.saturating_add(1);
@@ -2474,6 +2573,66 @@ mod tests {
         assert_eq!(db.get(b"a").unwrap(), Some(b"1".to_vec()));
         assert_eq!(db.get(b"b").unwrap(), None);
         assert_eq!(db.get(b"c").unwrap(), Some(b"3".to_vec()));
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn delete_range_does_not_delete_newer_puts() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("db");
+        let db = DB::open(
+            &path,
+            Options {
+                sync: SyncMode::No,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        db.put(b"a", b"1").unwrap();
+        db.put(b"b", b"2").unwrap();
+        db.delete_range(Range {
+            start: Bound::Included(b"a".to_vec()),
+            end: Bound::Excluded(b"z".to_vec()),
+        })
+        .unwrap();
+        db.put(b"b", b"new").unwrap();
+
+        assert_eq!(db.get(b"a").unwrap(), None);
+        assert_eq!(db.get(b"b").unwrap(), Some(b"new".to_vec()));
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn iter_respects_range_tombstones_starting_before_range_start() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("db");
+        let db = DB::open(
+            &path,
+            Options {
+                sync: SyncMode::No,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        db.put(b"a", b"1").unwrap();
+        db.put(b"b", b"2").unwrap();
+        db.put(b"c", b"3").unwrap();
+        db.delete_range(Range {
+            start: Bound::Included(b"a".to_vec()),
+            end: Bound::Excluded(b"z".to_vec()),
+        })
+        .unwrap();
+
+        let items: Vec<_> = db
+            .iter(Range {
+                start: Bound::Included(b"b".to_vec()),
+                end: Bound::Excluded(b"d".to_vec()),
+            })
+            .unwrap()
+            .collect();
+        assert!(items.is_empty());
         db.close().unwrap();
     }
 
