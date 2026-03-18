@@ -97,6 +97,7 @@ pub struct DbMetrics {
     pub stall_waits: u64,
     pub flushes: u64,
     pub compactions: u64,
+    pub trivial_moves: u64,
     pub background_errors: u64,
     pub checkpoints: u64,
 }
@@ -412,6 +413,7 @@ impl DB {
                 s.push_str(&format!("stall_waits: {}\n", w.metrics.stall_waits));
                 s.push_str(&format!("flushes: {}\n", w.metrics.flushes));
                 s.push_str(&format!("compactions: {}\n", w.metrics.compactions));
+                s.push_str(&format!("trivial_moves: {}\n", w.metrics.trivial_moves));
                 s.push_str(&format!(
                     "background_errors: {}\n",
                     w.metrics.background_errors
@@ -1936,6 +1938,26 @@ fn compact_level_to_next(db_dir: &Path, w: &mut WriterState, level: usize) -> Re
     let (overlaps, _min_user, _max_user) =
         collect_overlaps_expanding(&w.version.levels[level + 1], min_user, max_user)?;
 
+    if overlaps.is_empty() {
+        let mut moved = input.clone();
+        moved.level = (level + 1) as u32;
+        let deletes = vec![(level as u32, input.file_id)];
+
+        let last_sequence = w.next_seq.saturating_sub(1);
+        failpoint::io_err("compaction:before_manifest_edit")?;
+        failpoint::hit("compaction:before_manifest_edit");
+        w.manifest
+            .append_compaction_edit(&moved, &deletes, last_sequence)?;
+        failpoint::io_err("compaction:after_manifest_edit")?;
+        failpoint::hit("compaction:after_manifest_edit");
+        w.version.last_sequence = w.version.last_sequence.max(last_sequence);
+
+        w.version.levels[level].retain(|m| m.file_id != input.file_id);
+        w.version.levels[level + 1].push(moved);
+        w.metrics.trivial_moves = w.metrics.trivial_moves.saturating_add(1);
+        return Ok(());
+    }
+
     let file_id = w.next_file_id;
     w.next_file_id = w.next_file_id.saturating_add(1);
     let tmp_path = db_dir.join(sst_temp_file_name(file_id));
@@ -2869,6 +2891,41 @@ mod tests {
         assert!(w.version.levels[0].is_empty());
         assert!(w.version.levels[1].is_empty());
         assert_eq!(w.version.levels[2].len(), 1);
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn trivial_move_compaction_moves_file_without_rewrite() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("db");
+        let opts = Options {
+            sync: SyncMode::No,
+            memtable_max_bytes: 1,
+            l0_slowdown_trigger: 0,
+            l0_stop_trigger: 1000,
+            max_levels: 3,
+            level1_target_bytes: 1,
+            level_multiplier: 1,
+            ..Options::default()
+        };
+
+        let db = DB::open(&path, opts).unwrap();
+        db.put(b"a", b"1").unwrap();
+        db.put(b"b", b"2").unwrap();
+
+        for _ in 0..500 {
+            if db.metrics().unwrap().trivial_moves >= 1 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(db.metrics().unwrap().trivial_moves >= 1);
+
+        let w = db.shared.state.lock().unwrap();
+        assert!(w.version.levels.len() >= 3);
+        assert!(w.version.levels[1].is_empty());
+        assert_eq!(w.version.levels[2].len(), 1);
+        drop(w);
         db.close().unwrap();
     }
 }
