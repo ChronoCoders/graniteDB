@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
@@ -46,6 +46,20 @@ pub struct WriteOptions {
 pub struct ColumnFamily {
     pub id: u32,
     pub name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+struct TxKey {
+    cf_id: u32,
+    key: Vec<u8>,
+}
+
+pub struct Transaction<'a> {
+    db: &'a DB,
+    snapshot: Snapshot,
+    reads: HashSet<TxKey>,
+    batch: WriteBatch,
+    write_options: WriteOptions,
 }
 
 #[derive(Clone, Debug)]
@@ -293,6 +307,16 @@ impl DB {
             return Err(e);
         }
         w.wal.sync()
+    }
+
+    pub fn begin_transaction(&self) -> Result<Transaction<'_>> {
+        Ok(Transaction {
+            db: self,
+            snapshot: self.snapshot()?,
+            reads: HashSet::new(),
+            batch: WriteBatch::default(),
+            write_options: WriteOptions::default(),
+        })
     }
 
     pub fn metrics(&self) -> Result<DbMetrics> {
@@ -571,6 +595,157 @@ impl DB {
         Ok(())
     }
 
+    fn commit_transaction(
+        &self,
+        snapshot: Snapshot,
+        mut reads: HashSet<TxKey>,
+        batch: WriteBatch,
+        write_options: WriteOptions,
+    ) -> Result<()> {
+        for op in &batch.ops {
+            match op {
+                WriteOp::Put { cf_id, key, .. } => {
+                    reads.insert(TxKey {
+                        cf_id: *cf_id,
+                        key: key.clone(),
+                    });
+                }
+                WriteOp::Delete { cf_id, key } => {
+                    reads.insert(TxKey {
+                        cf_id: *cf_id,
+                        key: key.clone(),
+                    });
+                }
+            }
+        }
+
+        let mut w = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| GraniteError::Corrupt("poisoned"))?;
+
+        if let Some(e) = w.bg_error.take() {
+            return Err(e);
+        }
+
+        let op_index = w.next_op_index;
+        w.next_op_index = w.next_op_index.saturating_add(1);
+        let _op_guard = failpoint::set_current_op_index(op_index);
+
+        loop {
+            if let Some(e) = w.bg_error.take() {
+                return Err(e);
+            }
+
+            let stall = w.imm_memtable.is_some()
+                || w.imm_flushing
+                || compaction_needed(&w)
+                || w.version.levels[0].len() > w.options.l0_stop_trigger;
+            if !stall {
+                break;
+            }
+
+            w.metrics.stall_waits = w.metrics.stall_waits.saturating_add(1);
+            let reason = if w.imm_memtable.is_some() || w.imm_flushing {
+                DbStallReason::ImmutableMemtable
+            } else if w.version.levels[0].len() > w.options.l0_stop_trigger {
+                DbStallReason::L0Stop
+            } else {
+                DbStallReason::CompactionNeeded
+            };
+            w.record_event(DbEventKind::Stall { reason });
+
+            self.shared.cv.notify_all();
+            w = self
+                .shared
+                .cv
+                .wait(w)
+                .map_err(|_| GraniteError::Corrupt("poisoned"))?;
+        }
+
+        for k in &reads {
+            if let Some(latest) = self.latest_seq_for_cf_key(&w, k.cf_id, &k.key)?
+                && latest > snapshot.read_seq
+            {
+                return Err(GraniteError::InvalidArgument("transaction conflict"));
+            }
+        }
+
+        w.metrics.write_batches = w.metrics.write_batches.saturating_add(1);
+        for op in &batch.ops {
+            match op {
+                WriteOp::Put { .. } => {
+                    w.metrics.puts = w.metrics.puts.saturating_add(1);
+                }
+                WriteOp::Delete { .. } => {
+                    w.metrics.deletes = w.metrics.deletes.saturating_add(1);
+                }
+            }
+        }
+
+        let start_seq = w.next_seq;
+        let record = encode_batch_as_wal_record(&batch, start_seq);
+        w.wal.append_logical_record(&record)?;
+        let sync = write_options.sync.unwrap_or(w.options.sync);
+        if sync == SyncMode::Yes {
+            w.wal.sync()?;
+        }
+        apply_batch_to_memtable_at_seq(&mut w.memtable, &batch, start_seq);
+        w.next_seq = start_seq.saturating_add(batch.ops.len() as u64);
+
+        if w.memtable.approx_bytes() >= w.options.memtable_max_bytes {
+            while w.imm_memtable.is_some() {
+                w = self
+                    .shared
+                    .cv
+                    .wait(w)
+                    .map_err(|_| GraniteError::Corrupt("poisoned"))?;
+                if let Some(e) = w.bg_error.take() {
+                    return Err(e);
+                }
+            }
+
+            let prev_log = w.wal_id;
+            let next_log = w.wal_id.saturating_add(1);
+            let next_log_path = self.path.join(wal_file_name(next_log));
+            failpoint::io_err("flush:before_new_wal_create")?;
+            failpoint::hit("flush:before_new_wal_create");
+            let (next_wal, _rec) = Wal::open(&next_log_path, w.options.sync)?;
+            failpoint::io_err("flush:after_new_wal_create")?;
+            failpoint::hit("flush:after_new_wal_create");
+            if w.options.sync == SyncMode::Yes {
+                sync_parent_dir(&next_log_path)?;
+            }
+
+            let last_sequence = w.next_seq.saturating_sub(1);
+            failpoint::io_err("flush:before_manifest_edit")?;
+            failpoint::hit("flush:before_manifest_edit");
+            w.manifest
+                .append_log_rotation_edit(prev_log, next_log, last_sequence)?;
+            failpoint::io_err("flush:after_manifest_edit")?;
+            failpoint::hit("flush:after_manifest_edit");
+
+            w.prev_wal_id = prev_log;
+            w.version.prev_log_number = prev_log;
+            w.wal_id = next_log;
+            w.version.log_number = next_log;
+            w.wal = next_wal;
+            w.imm_memtable = Some(Arc::new(std::mem::take(&mut w.memtable)));
+            w.memtable = MemTable::default();
+            w.imm_trigger_op_index = op_index;
+            let version_snapshot = w.version.clone();
+            let target = w.options.manifest_checkpoint_target_bytes;
+            if let Some(manifest_number) = w.manifest.maybe_checkpoint(&version_snapshot, target)? {
+                w.metrics.checkpoints = w.metrics.checkpoints.saturating_add(1);
+                w.record_event(DbEventKind::CheckpointFinish { manifest_number });
+            }
+            self.shared.cv.notify_all();
+        }
+
+        Ok(())
+    }
+
     pub fn snapshot(&self) -> Result<Snapshot> {
         let w = self
             .shared
@@ -579,6 +754,44 @@ impl DB {
             .map_err(|_| GraniteError::Corrupt("poisoned"))?;
         let read_seq = w.next_seq.saturating_sub(1);
         Ok(Snapshot { read_seq })
+    }
+
+    fn latest_seq_for_cf_key(
+        &self,
+        w: &WriterState,
+        cf_id: u32,
+        user_key: &[u8],
+    ) -> Result<Option<u64>> {
+        let key = encode_cf_user_key(cf_id, user_key);
+        if let Some(seq) = w.memtable.latest_seq(&key) {
+            return Ok(Some(seq));
+        }
+        if let Some(imm) = w.imm_memtable.as_ref()
+            && let Some(seq) = imm.latest_seq(&key)
+        {
+            return Ok(Some(seq));
+        }
+
+        for meta in w.version.levels[0].iter().rev() {
+            let path = self.path.join(sst_file_name(meta.file_id));
+            let mut reader = TableReader::open_with_cache(path, Some(w.block_cache.clone()))?;
+            if let Some(seq) = reader.latest_seq(&key)? {
+                return Ok(Some(seq));
+            }
+        }
+        for level in w.version.levels.iter().skip(1) {
+            for meta in level {
+                if !meta_may_contain_user_key(meta, &key)? {
+                    continue;
+                }
+                let path = self.path.join(sst_file_name(meta.file_id));
+                let mut reader = TableReader::open_with_cache(path, Some(w.block_cache.clone()))?;
+                if let Some(seq) = reader.latest_seq(&key)? {
+                    return Ok(Some(seq));
+                }
+            }
+        }
+        Ok(None)
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -783,6 +996,68 @@ fn startup_gc(db_dir: &Path, version: &VersionSet) -> Result<()> {
         }
     }
     Ok(())
+}
+
+impl<'a> Transaction<'a> {
+    pub fn snapshot(&self) -> Snapshot {
+        self.snapshot
+    }
+
+    pub fn set_write_options(&mut self, write_options: WriteOptions) {
+        self.write_options = write_options;
+    }
+
+    pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.get_cf_id(0, key)
+    }
+
+    pub fn get_cf(&mut self, cf: &ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.get_cf_id(cf.id, key)
+    }
+
+    fn get_cf_id(&mut self, cf_id: u32, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.reads.insert(TxKey {
+            cf_id,
+            key: key.to_vec(),
+        });
+        self.db.get_cf_with_snapshot_id(cf_id, key, self.snapshot)
+    }
+
+    pub fn put(&mut self, key: &[u8], value: &[u8]) {
+        self.put_cf_id(0, key, value);
+    }
+
+    pub fn put_cf(&mut self, cf: &ColumnFamily, key: &[u8], value: &[u8]) {
+        self.put_cf_id(cf.id, key, value);
+    }
+
+    fn put_cf_id(&mut self, cf_id: u32, key: &[u8], value: &[u8]) {
+        self.batch.ops.push(WriteOp::Put {
+            cf_id,
+            key: key.to_vec(),
+            value: value.to_vec(),
+        });
+    }
+
+    pub fn delete(&mut self, key: &[u8]) {
+        self.delete_cf_id(0, key);
+    }
+
+    pub fn delete_cf(&mut self, cf: &ColumnFamily, key: &[u8]) {
+        self.delete_cf_id(cf.id, key);
+    }
+
+    fn delete_cf_id(&mut self, cf_id: u32, key: &[u8]) {
+        self.batch.ops.push(WriteOp::Delete {
+            cf_id,
+            key: key.to_vec(),
+        });
+    }
+
+    pub fn commit(self) -> Result<()> {
+        self.db
+            .commit_transaction(self.snapshot, self.reads, self.batch, self.write_options)
+    }
 }
 
 fn wal_file_name(file_id: u64) -> String {

@@ -45,6 +45,17 @@ impl MemTable {
         Ok(None)
     }
 
+    pub fn latest_seq(&self, user_key: &[u8]) -> Option<u64> {
+        let start = InternalKey::new(user_key.to_vec(), u64::MAX, ValueType::Tombstone);
+        let mut it = self.map.range((Bound::Included(start), Bound::Unbounded));
+        if let Some((k, _)) = it.next()
+            && k.user_key() == user_key
+        {
+            return Some(k.seq());
+        }
+        None
+    }
+
     pub fn iter_internal(&self) -> impl Iterator<Item = (Vec<u8>, Vec<u8>)> + '_ {
         self.map.iter().map(|(k, v)| (k.to_bytes(), v.clone()))
     }

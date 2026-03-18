@@ -20,7 +20,7 @@ mod write_batch;
 
 pub use crate::db::{
     ColumnFamily, DB, DbEvent, DbEventKind, DbIterator, DbMetrics, DbStallReason, Range,
-    ReadOptions, Snapshot, WriteOptions,
+    ReadOptions, Snapshot, Transaction, WriteOptions,
 };
 pub use crate::error::{GraniteError, Result};
 pub use crate::options::{Compression, Options, SyncMode};
