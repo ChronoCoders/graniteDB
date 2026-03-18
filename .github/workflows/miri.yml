@@ -13,6 +13,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
+      - uses: Swatinem/rust-cache@v2
       - name: miri setup
         run: cargo miri setup
       - name: miri test
