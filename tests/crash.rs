@@ -210,7 +210,7 @@ fn compute_expected_state(
         "padding" => {
             let mut state = BTreeMap::new();
             if writes_to_apply >= 1 {
-                let mut value = vec![0u8; 32_738];
+                let mut value = vec![0u8; 32_730];
                 value[..8].copy_from_slice(&seed.to_le_bytes());
                 state.insert(b"k".to_vec(), Some(value));
             }

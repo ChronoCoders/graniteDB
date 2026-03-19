@@ -107,7 +107,7 @@ fn run_random_scenario(db: &DB, seed: u64, op_count: u64, ack_log: &mut std::fs:
 }
 
 fn run_padding_scenario(db: &DB, seed: u64, ack_log: &mut std::fs::File) {
-    let mut value = vec![0u8; 32_738];
+    let mut value = vec![0u8; 32_730];
     value[..8].copy_from_slice(&seed.to_le_bytes());
     db.put(b"k", &value).expect("put large");
     log_acked_write(ack_log, 0);
