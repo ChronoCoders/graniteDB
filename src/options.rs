@@ -14,6 +14,7 @@ pub enum Compression {
 pub enum CompactionStyle {
     Leveled,
     Fifo,
+    Universal,
 }
 
 #[derive(Clone)]
@@ -27,6 +28,9 @@ pub struct Options {
     pub level_multiplier: u64,
     pub compaction_style: CompactionStyle,
     pub fifo_l0_max_bytes: u64,
+    pub universal_min_merge_width: usize,
+    pub universal_max_merge_width: usize,
+    pub universal_size_ratio: u32,
     pub bloom_bits_per_key: u8,
     pub sstable_compression: Compression,
     pub merge_operator: std::sync::Arc<dyn crate::merge::MergeOperator>,
@@ -50,6 +54,9 @@ impl std::fmt::Debug for Options {
             .field("level_multiplier", &self.level_multiplier)
             .field("compaction_style", &self.compaction_style)
             .field("fifo_l0_max_bytes", &self.fifo_l0_max_bytes)
+            .field("universal_min_merge_width", &self.universal_min_merge_width)
+            .field("universal_max_merge_width", &self.universal_max_merge_width)
+            .field("universal_size_ratio", &self.universal_size_ratio)
             .field("bloom_bits_per_key", &self.bloom_bits_per_key)
             .field("sstable_compression", &self.sstable_compression)
             .field("max_write_bytes_per_sec", &self.max_write_bytes_per_sec)
@@ -86,6 +93,9 @@ impl Default for Options {
             level_multiplier: 10,
             compaction_style: CompactionStyle::Leveled,
             fifo_l0_max_bytes: 0,
+            universal_min_merge_width: 2,
+            universal_max_merge_width: 8,
+            universal_size_ratio: 20,
             bloom_bits_per_key: 10,
             sstable_compression: Compression::None,
             merge_operator: crate::merge::default_merge_operator(),

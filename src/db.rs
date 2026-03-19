@@ -1661,6 +1661,11 @@ fn compaction_needed(w: &WriterState) -> bool {
             return true;
         }
     }
+    if w.options.compaction_style == CompactionStyle::Universal
+        && w.version.levels[0].len() > w.options.universal_min_merge_width.max(2)
+    {
+        return true;
+    }
     if w.version.levels[0].len() > w.options.l0_slowdown_trigger {
         return true;
     }
@@ -1938,6 +1943,11 @@ fn maybe_compact_levels(db_dir: &Path, w: &mut WriterState) -> Result<()> {
         return Ok(());
     }
 
+    if w.options.compaction_style == CompactionStyle::Universal {
+        universal_compact_l0(db_dir, w)?;
+        return Ok(());
+    }
+
     let mut steps = 0usize;
     let max_steps = max_levels.saturating_mul(4).max(8);
     loop {
@@ -2010,6 +2020,203 @@ fn fifo_compact_l0(db_dir: &Path, w: &mut WriterState) -> Result<()> {
         w.version.levels[0].remove(idx);
         let _ = fs::remove_file(db_dir.join(sst_file_name(file_id)));
     }
+}
+
+fn universal_compact_l0(db_dir: &Path, w: &mut WriterState) -> Result<()> {
+    if w.version.levels[0].len() < w.options.universal_min_merge_width.max(2) {
+        return Ok(());
+    }
+    let min_w = w.options.universal_min_merge_width.max(2);
+    let max_w = w.options.universal_max_merge_width.max(min_w);
+    let ratio = w.options.universal_size_ratio.max(1) as u64;
+
+    let mut l0 = w.version.levels[0].clone();
+    l0.sort_by_key(|m| m.file_id);
+    if l0.len() < min_w {
+        return Ok(());
+    }
+
+    let mut picked: Vec<crate::sstable::FileMeta> = Vec::new();
+    let mut sum: u64 = 0;
+    for m in l0 {
+        if picked.len() >= max_w {
+            break;
+        }
+        if picked.is_empty() {
+            sum = m.file_size;
+            picked.push(m);
+            continue;
+        }
+        let limit = sum.saturating_mul(ratio).saturating_div(100).max(1);
+        if m.file_size <= limit {
+            sum = sum.saturating_add(m.file_size);
+            picked.push(m);
+        } else {
+            break;
+        }
+    }
+    if picked.len() < min_w {
+        return Ok(());
+    }
+
+    let mut sources: Vec<crate::sstable::SstScanner> = Vec::new();
+    for meta in &picked {
+        let path = db_dir.join(sst_file_name(meta.file_id));
+        let reader = TableReader::open_with_cache(path, Some(w.block_cache.clone()))?;
+        sources.push(reader.scanner());
+    }
+
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
+    #[derive(Clone, Eq, PartialEq)]
+    struct HeapEntry {
+        key: Vec<u8>,
+        src: usize,
+        value: Vec<u8>,
+    }
+
+    impl Ord for HeapEntry {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            match cmp_internal_key_bytes_unchecked(&self.key, &other.key) {
+                std::cmp::Ordering::Equal => self.src.cmp(&other.src),
+                other => other,
+            }
+        }
+    }
+
+    impl PartialOrd for HeapEntry {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    let mut heap: BinaryHeap<Reverse<HeapEntry>> = BinaryHeap::new();
+    for (i, s) in sources.iter_mut().enumerate() {
+        if let Some((k, v)) = s.next_item()? {
+            heap.push(Reverse(HeapEntry {
+                key: k,
+                src: i,
+                value: v,
+            }));
+        }
+    }
+
+    let file_id = w.next_file_id;
+    w.next_file_id = w.next_file_id.saturating_add(1);
+    let tmp_path = db_dir.join(sst_temp_file_name(file_id));
+    let final_path = db_dir.join(sst_file_name(file_id));
+
+    let mut builder = TableBuilder::create(
+        &tmp_path,
+        w.options.bloom_bits_per_key,
+        w.options.sstable_compression,
+    )?;
+
+    let now_micros = now_micros();
+    let smallest_snapshot = u64::MAX;
+    let mut current_user_key: Option<Vec<u8>> = None;
+    let mut kept_snapshot_version_for_user_key = false;
+
+    while let Some(Reverse(e)) = heap.pop() {
+        let (user_key, seq, value_type) = {
+            let parsed = parse_internal_key(&e.key)?;
+            (parsed.user_key.to_vec(), parsed.seq, parsed.value_type)
+        };
+        let is_new_user_key = match current_user_key.as_ref() {
+            Some(cur) => cur.as_slice() != user_key.as_slice(),
+            None => true,
+        };
+        if is_new_user_key {
+            current_user_key = Some(user_key.clone());
+            kept_snapshot_version_for_user_key = false;
+        }
+
+        let mut out_key = e.key;
+        let mut out_value = e.value;
+
+        if w.options.ttl_filter_from_value_prefix_micros
+            && value_type == ValueType::Value
+            && out_value.len() >= 8
+        {
+            let expiry = u64::from_le_bytes(out_value[..8].try_into().unwrap_or([0u8; 8]));
+            if expiry <= now_micros {
+                out_key = encode_internal_key(&user_key, seq, ValueType::Tombstone);
+                out_value.clear();
+            }
+        }
+
+        if w.options.drop_obsolete_versions_during_compaction
+            && kept_snapshot_version_for_user_key
+            && value_type != ValueType::RangeTombstone
+            && value_type != ValueType::MergeOperand
+        {
+            if let Some((nk, nv)) = sources[e.src].next_item()? {
+                heap.push(Reverse(HeapEntry {
+                    key: nk,
+                    src: e.src,
+                    value: nv,
+                }));
+            }
+            continue;
+        }
+
+        builder.add(&out_key, &out_value)?;
+        if w.options.drop_obsolete_versions_during_compaction
+            && seq <= smallest_snapshot
+            && matches!(value_type, ValueType::Value | ValueType::Tombstone)
+        {
+            kept_snapshot_version_for_user_key = true;
+        }
+
+        if let Some((nk, nv)) = sources[e.src].next_item()? {
+            heap.push(Reverse(HeapEntry {
+                key: nk,
+                src: e.src,
+                value: nv,
+            }));
+        }
+    }
+
+    failpoint::io_err("compaction:before_sst_finish")?;
+    failpoint::hit("compaction:before_sst_finish");
+    let mut out_meta = builder.finish(w.options.sync == SyncMode::Yes)?;
+    failpoint::io_err("compaction:after_sst_finish")?;
+    failpoint::hit("compaction:after_sst_finish");
+    out_meta.file_id = file_id;
+    out_meta.level = 0;
+
+    failpoint::io_err("compaction:before_sst_rename")?;
+    failpoint::hit("compaction:before_sst_rename");
+    fs::rename(&tmp_path, &final_path)?;
+    failpoint::io_err("compaction:after_sst_rename")?;
+    failpoint::hit("compaction:after_sst_rename");
+    if w.options.sync == SyncMode::Yes {
+        failpoint::io_err("compaction:before_dir_sync")?;
+        failpoint::hit("compaction:before_dir_sync");
+        sync_parent_dir(&final_path)?;
+        failpoint::io_err("compaction:after_dir_sync")?;
+        failpoint::hit("compaction:after_dir_sync");
+    }
+
+    let deletes: Vec<(u32, u64)> = picked.iter().map(|m| (0u32, m.file_id)).collect();
+    let last_sequence = w.next_seq.saturating_sub(1);
+    failpoint::io_err("compaction:before_manifest_edit")?;
+    failpoint::hit("compaction:before_manifest_edit");
+    w.manifest
+        .append_compaction_edit(&out_meta, &deletes, last_sequence)?;
+    failpoint::io_err("compaction:after_manifest_edit")?;
+    failpoint::hit("compaction:after_manifest_edit");
+    w.version.last_sequence = w.version.last_sequence.max(last_sequence);
+
+    let del_ids: std::collections::BTreeSet<u64> = picked.iter().map(|m| m.file_id).collect();
+    w.version.levels[0].retain(|m| !del_ids.contains(&m.file_id));
+    w.version.levels[0].push(out_meta);
+
+    for id in del_ids {
+        let _ = fs::remove_file(db_dir.join(sst_file_name(id)));
+    }
+    Ok(())
 }
 
 fn level_total_bytes(version: &VersionSet, level: usize) -> u64 {
@@ -2805,6 +3012,46 @@ mod tests {
 
         assert_eq!(db.get(b"k\x00").unwrap(), None);
         assert_eq!(db.get(b"k\x09").unwrap(), Some(vec![b'x'; 80]));
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn universal_compaction_merges_multiple_l0_files() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("db");
+        let opts = Options {
+            sync: SyncMode::No,
+            memtable_max_bytes: 1,
+            compaction_style: CompactionStyle::Universal,
+            universal_min_merge_width: 2,
+            universal_max_merge_width: 4,
+            universal_size_ratio: 200,
+            l0_slowdown_trigger: 1000,
+            l0_stop_trigger: 2000,
+            max_levels: 2,
+            ..Options::default()
+        };
+
+        let db = DB::open(&path, opts).unwrap();
+        for i in 0..6u8 {
+            let k = [b'k', i];
+            db.put(&k, &[b'x'; 80]).unwrap();
+        }
+
+        for _ in 0..500 {
+            let w = db.shared.state.lock().unwrap();
+            if w.version.levels[0].len() < 6 {
+                break;
+            }
+            drop(w);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let w = db.shared.state.lock().unwrap();
+        assert!(w.version.levels[0].len() < 6);
+        drop(w);
+        assert_eq!(db.get(b"k\x00").unwrap(), Some(vec![b'x'; 80]));
+        assert_eq!(db.get(b"k\x05").unwrap(), Some(vec![b'x'; 80]));
         db.close().unwrap();
     }
 
