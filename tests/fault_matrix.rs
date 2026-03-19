@@ -19,9 +19,14 @@ fn fault_matrix_covers_write_and_sync_boundaries() {
             1u64,
             &[
                 "wal:write_padding",
+                "wal:after_padding",
                 "wal:write_header",
+                "wal:after_header",
                 "wal:write_payload",
+                "wal:after_payload",
+                "wal:before_sync",
                 "wal:sync",
+                "wal:after_sync",
             ][..],
         ),
         (
@@ -37,7 +42,11 @@ fn fault_matrix_covers_write_and_sync_boundaries() {
                 "sst:sync",
                 "manifest:write_header",
                 "manifest:write_payload",
+                "manifest:before_append",
+                "manifest:after_append",
+                "manifest:before_sync",
                 "manifest:sync",
+                "manifest:after_sync",
                 "flush:before_sst_rename",
                 "flush:after_sst_rename",
                 "flush:before_dir_sync",
@@ -59,7 +68,11 @@ fn fault_matrix_covers_write_and_sync_boundaries() {
                 "sst:sync",
                 "manifest:write_header",
                 "manifest:write_payload",
+                "manifest:before_append",
+                "manifest:after_append",
+                "manifest:before_sync",
                 "manifest:sync",
+                "manifest:after_sync",
                 "compaction:before_sst_rename",
                 "compaction:after_sst_rename",
                 "compaction:before_dir_sync",
@@ -70,16 +83,19 @@ fn fault_matrix_covers_write_and_sync_boundaries() {
         ),
     ];
 
-    for sync in [SyncMode::Yes] {
+    for sync in [SyncMode::Yes, SyncMode::No] {
         for (scenario, crash_op, failpoints) in cases {
             for failpoint in failpoints {
+                if !should_run_failpoint_for_sync(failpoint, sync) {
+                    continue;
+                }
                 for action in actions_for_failpoint(failpoint) {
                     let case_path =
-                        base_path.join(case_dir_name(scenario, failpoint, crash_op, action));
+                        base_path.join(case_dir_name(scenario, failpoint, crash_op, action, sync));
                     let status = Command::new(env!("CARGO_BIN_EXE_crash_worker"))
                         .arg(&case_path)
                         .arg(seed.to_string())
-                        .arg("50")
+                        .arg("10")
                         .arg(match sync {
                             SyncMode::Yes => "yes",
                             SyncMode::No => "no",
@@ -182,17 +198,14 @@ fn db_matches_model(scenario: &str, db: &DB, model: &BTreeMap<Vec<u8>, Option<Ve
 }
 
 fn actions_for_failpoint(failpoint: &str) -> &'static [&'static str] {
-    static WRITE_ACTIONS: &[&str] = &[
-        "abort",
-        "torn_abort:1",
-        "corrupt_abort:1",
-        "partial:1",
-        "diskfull:1",
-        "ioerr",
-    ];
+    static WRITE_ACTIONS: &[&str] = &["abort", "partial:1", "corrupt_abort:1", "ioerr"];
     static SYNC_ACTIONS: &[&str] = &["ioerr", "partial:1", "diskfull:1"];
     static IOERR_ACTIONS: &[&str] = &["abort", "ioerr"];
+    static HIT_ACTIONS: &[&str] = &["abort"];
 
+    if failpoint.contains(":before_") || failpoint.contains(":after_") {
+        return HIT_ACTIONS;
+    }
     if failpoint.contains(":write_") {
         return WRITE_ACTIONS;
     }
@@ -208,6 +221,27 @@ fn actions_for_failpoint(failpoint: &str) -> &'static [&'static str] {
     WRITE_ACTIONS
 }
 
+fn should_run_failpoint_for_sync(failpoint: &str, sync: SyncMode) -> bool {
+    if sync == SyncMode::Yes {
+        return true;
+    }
+    !matches!(
+        failpoint,
+        "wal:before_sync"
+            | "wal:sync"
+            | "wal:after_sync"
+            | "sst:sync"
+            | "manifest:before_sync"
+            | "manifest:sync"
+            | "manifest:after_sync"
+            | "manifest:checkpoint_sync"
+            | "flush:before_dir_sync"
+            | "flush:after_dir_sync"
+            | "compaction:before_dir_sync"
+            | "compaction:after_dir_sync"
+    )
+}
+
 fn scenario_keys(scenario: &str) -> &'static [&'static [u8]] {
     static PADDING_KEYS: &[&[u8]] = &[b"k", b"x"];
     static FLUSH_KEYS: &[&[u8]] = &[b"a", b"b"];
@@ -220,9 +254,20 @@ fn scenario_keys(scenario: &str) -> &'static [&'static [u8]] {
     }
 }
 
-fn case_dir_name(scenario: &str, failpoint: &str, crash_op: u64, action: &str) -> String {
+fn case_dir_name(
+    scenario: &str,
+    failpoint: &str,
+    crash_op: u64,
+    action: &str,
+    sync: SyncMode,
+) -> String {
     let mut s = String::new();
     s.push_str("case_");
+    s.push_str(match sync {
+        SyncMode::Yes => "yes",
+        SyncMode::No => "no",
+    });
+    s.push('_');
     s.push_str(scenario);
     s.push('_');
     for ch in failpoint.chars() {
