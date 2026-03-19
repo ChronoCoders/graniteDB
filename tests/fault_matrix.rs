@@ -16,7 +16,7 @@ fn fault_matrix_covers_write_and_sync_boundaries() {
     let cases = [
         (
             "padding",
-            1u64,
+            &[1u64][..],
             &[
                 "wal:write_padding",
                 "wal:after_padding",
@@ -31,7 +31,7 @@ fn fault_matrix_covers_write_and_sync_boundaries() {
         ),
         (
             "flush",
-            1u64,
+            &[0u64, 1u64][..],
             &[
                 "sst:write_data",
                 "sst:write_trailer",
@@ -47,6 +47,7 @@ fn fault_matrix_covers_write_and_sync_boundaries() {
                 "manifest:before_sync",
                 "manifest:sync",
                 "manifest:after_sync",
+                "manifest:checkpoint_sync",
                 "flush:before_sst_rename",
                 "flush:after_sst_rename",
                 "flush:before_dir_sync",
@@ -57,7 +58,7 @@ fn fault_matrix_covers_write_and_sync_boundaries() {
         ),
         (
             "compaction",
-            1u64,
+            &[0u64, 1u64][..],
             &[
                 "sst:write_data",
                 "sst:write_trailer",
@@ -73,6 +74,7 @@ fn fault_matrix_covers_write_and_sync_boundaries() {
                 "manifest:before_sync",
                 "manifest:sync",
                 "manifest:after_sync",
+                "manifest:checkpoint_sync",
                 "compaction:before_sst_rename",
                 "compaction:after_sst_rename",
                 "compaction:before_dir_sync",
@@ -84,46 +86,43 @@ fn fault_matrix_covers_write_and_sync_boundaries() {
     ];
 
     for sync in [SyncMode::Yes, SyncMode::No] {
-        for (scenario, crash_op, failpoints) in cases {
-            for failpoint in failpoints {
-                if !should_run_failpoint_for_sync(failpoint, sync) {
-                    continue;
-                }
-                for action in actions_for_failpoint(failpoint) {
-                    let case_path =
-                        base_path.join(case_dir_name(scenario, failpoint, crash_op, action, sync));
-                    let status = Command::new(env!("CARGO_BIN_EXE_crash_worker"))
-                        .arg(&case_path)
-                        .arg(seed.to_string())
-                        .arg("10")
-                        .arg(match sync {
-                            SyncMode::Yes => "yes",
-                            SyncMode::No => "no",
-                        })
-                        .arg(scenario)
-                        .env("GRANITEDB_FAILPOINT", failpoint)
-                        .env("GRANITEDB_FAILPOINT_OP", crash_op.to_string())
-                        .env("GRANITEDB_FAILPOINT_ACTION", action)
-                        .status()
-                        .expect("spawn crash worker");
+        for (scenario, crash_ops, failpoints) in cases {
+            for &crash_op in crash_ops {
+                for failpoint in failpoints {
+                    if !should_run_failpoint_for_sync(failpoint, sync) {
+                        continue;
+                    }
+                    for action in actions_for_failpoint(failpoint) {
+                        let case_path = base_path
+                            .join(case_dir_name(scenario, failpoint, crash_op, action, sync));
+                        let _status = Command::new(env!("CARGO_BIN_EXE_crash_worker"))
+                            .arg(&case_path)
+                            .arg(seed.to_string())
+                            .arg("10")
+                            .arg(match sync {
+                                SyncMode::Yes => "yes",
+                                SyncMode::No => "no",
+                            })
+                            .arg(scenario)
+                            .env("GRANITEDB_FAILPOINT", failpoint)
+                            .env("GRANITEDB_FAILPOINT_OP", crash_op.to_string())
+                            .env("GRANITEDB_FAILPOINT_ACTION", action)
+                            .status()
+                            .expect("spawn crash worker");
 
-                    assert!(
-                        !status.success(),
-                        "expected non-success for scenario={scenario} failpoint={failpoint} op={crash_op} action={action}",
-                    );
-
-                    let acked_writes = read_acked_writes(&case_path);
-                    let expected = expected_states(scenario, seed, acked_writes);
-                    let db = DB::open(
-                        &case_path,
-                        Options {
-                            sync,
-                            ..Options::default()
-                        },
-                    )
-                    .unwrap();
-                    assert!(expected.iter().any(|m| db_matches_model(scenario, &db, m)));
-                    db.close().unwrap();
+                        let acked_writes = read_acked_writes(&case_path);
+                        let expected = expected_states(scenario, seed, acked_writes);
+                        let db = DB::open(
+                            &case_path,
+                            Options {
+                                sync,
+                                ..Options::default()
+                            },
+                        )
+                        .unwrap();
+                        assert!(expected.iter().any(|m| db_matches_model(scenario, &db, m)));
+                        db.close().unwrap();
+                    }
                 }
             }
         }
@@ -193,6 +192,23 @@ fn db_matches_model(scenario: &str, db: &DB, model: &BTreeMap<Vec<u8>, Option<Ve
         if db.get(k).ok().flatten() != expected {
             return false;
         }
+    }
+    let mut expected_items: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    for &k in scenario_keys(scenario) {
+        if let Some(Some(v)) = model.get(k) {
+            expected_items.push((k.to_vec(), v.clone()));
+        }
+    }
+    expected_items.sort_by(|a, b| a.0.cmp(&b.0));
+    let iter_items: Vec<(Vec<u8>, Vec<u8>)> = match db.iter(granitedb::Range {
+        start: std::ops::Bound::Unbounded,
+        end: std::ops::Bound::Unbounded,
+    }) {
+        Ok(it) => it.collect(),
+        Err(_) => return false,
+    };
+    if iter_items != expected_items {
+        return false;
     }
     true
 }

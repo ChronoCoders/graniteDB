@@ -29,6 +29,7 @@ fn main() {
             memtable_max_bytes: 1,
             l0_slowdown_trigger: 1000,
             l0_stop_trigger: 2000,
+            manifest_checkpoint_target_bytes: 1,
             ..Options::default()
         },
         "compaction" => Options {
@@ -36,6 +37,7 @@ fn main() {
             memtable_max_bytes: 1,
             l0_slowdown_trigger: 1,
             l0_stop_trigger: 2,
+            manifest_checkpoint_target_bytes: 1,
             ..Options::default()
         },
         "ioerr_flush" => Options {
@@ -43,6 +45,7 @@ fn main() {
             memtable_max_bytes: 1,
             l0_slowdown_trigger: 1000,
             l0_stop_trigger: 2000,
+            manifest_checkpoint_target_bytes: 1,
             ..Options::default()
         },
         "ioerr_compaction" => Options {
@@ -50,6 +53,7 @@ fn main() {
             memtable_max_bytes: 1,
             l0_slowdown_trigger: 1,
             l0_stop_trigger: 2,
+            manifest_checkpoint_target_bytes: 1,
             ..Options::default()
         },
         _ => Options {
