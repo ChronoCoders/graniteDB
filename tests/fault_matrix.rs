@@ -48,6 +48,19 @@ fn fault_matrix_covers_write_and_sync_boundaries() {
                 "manifest:sync",
                 "manifest:after_sync",
                 "manifest:checkpoint_sync",
+                "current:write_payload",
+                "current:after_payload",
+                "current:write_newline",
+                "current:after_newline",
+                "current:before_sync",
+                "current:sync",
+                "current:after_sync",
+                "current:rename",
+                "current:before_rename",
+                "current:after_rename",
+                "current:dir_sync",
+                "current:before_dir_sync",
+                "current:after_dir_sync",
                 "flush:before_sst_rename",
                 "flush:after_sst_rename",
                 "flush:before_dir_sync",
@@ -75,6 +88,19 @@ fn fault_matrix_covers_write_and_sync_boundaries() {
                 "manifest:sync",
                 "manifest:after_sync",
                 "manifest:checkpoint_sync",
+                "current:write_payload",
+                "current:after_payload",
+                "current:write_newline",
+                "current:after_newline",
+                "current:before_sync",
+                "current:sync",
+                "current:after_sync",
+                "current:rename",
+                "current:before_rename",
+                "current:after_rename",
+                "current:dir_sync",
+                "current:before_dir_sync",
+                "current:after_dir_sync",
                 "compaction:before_sst_rename",
                 "compaction:after_sst_rename",
                 "compaction:before_dir_sync",
@@ -217,10 +243,14 @@ fn actions_for_failpoint(failpoint: &str) -> &'static [&'static str] {
     static WRITE_ACTIONS: &[&str] = &["abort", "partial:1", "corrupt_abort:1", "ioerr"];
     static SYNC_ACTIONS: &[&str] = &["ioerr", "partial:1", "diskfull:1"];
     static IOERR_ACTIONS: &[&str] = &["abort", "ioerr"];
+    static IOERR_ONLY: &[&str] = &["ioerr"];
     static HIT_ACTIONS: &[&str] = &["abort"];
 
     if failpoint.contains(":before_") || failpoint.contains(":after_") {
         return HIT_ACTIONS;
+    }
+    if failpoint == "current:rename" || failpoint == "current:dir_sync" {
+        return IOERR_ONLY;
     }
     if failpoint.contains(":write_") {
         return WRITE_ACTIONS;
@@ -251,6 +281,12 @@ fn should_run_failpoint_for_sync(failpoint: &str, sync: SyncMode) -> bool {
             | "manifest:sync"
             | "manifest:after_sync"
             | "manifest:checkpoint_sync"
+            | "current:before_sync"
+            | "current:sync"
+            | "current:after_sync"
+            | "current:dir_sync"
+            | "current:before_dir_sync"
+            | "current:after_dir_sync"
             | "flush:before_dir_sync"
             | "flush:after_dir_sync"
             | "compaction:before_dir_sync"

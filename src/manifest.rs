@@ -1,5 +1,5 @@
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::error::{GraniteError, Result};
@@ -632,16 +632,26 @@ fn write_current(db_dir: &Path, manifest_name: &str, sync_mode: SyncMode) -> Res
             .read(true)
             .write(true)
             .open(&tmp_path)?;
-        f.write_all(manifest_name.as_bytes())?;
-        f.write_all(b"\n")?;
+        failpoint::write_all("current:write_payload", &mut f, manifest_name.as_bytes())?;
+        failpoint::hit("current:after_payload");
+        failpoint::write_all("current:write_newline", &mut f, b"\n")?;
+        failpoint::hit("current:after_newline");
         if sync_mode == SyncMode::Yes {
-            f.sync_data()?;
+            failpoint::hit("current:before_sync");
+            failpoint::sync_data("current:sync", &f)?;
+            failpoint::hit("current:after_sync");
         }
     }
 
+    failpoint::io_err("current:rename")?;
+    failpoint::hit("current:before_rename");
     std::fs::rename(&tmp_path, &final_path)?;
+    failpoint::hit("current:after_rename");
     if sync_mode == SyncMode::Yes {
+        failpoint::io_err("current:dir_sync")?;
+        failpoint::hit("current:before_dir_sync");
         sync_dir(db_dir)?;
+        failpoint::hit("current:after_dir_sync");
     }
     Ok(())
 }
@@ -694,6 +704,7 @@ fn read_bytes(bytes: &mut &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use std::io::Seek;
+    use std::io::Write;
 
     use tempfile::tempdir;
 
