@@ -3333,7 +3333,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn multi_level_compaction_can_push_l1_into_l2() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("db");
@@ -3352,13 +3351,16 @@ mod tests {
         db.put(b"a", b"1").unwrap();
         db.put(b"b", b"2").unwrap();
 
-        for _ in 0..200 {
+        // Wait for all flushes and compactions to settle: L0 and L1 empty, L2 non-empty.
+        // Two non-overlapping keys may land in separate SSTs in L2 (trivial-moved
+        // independently), so assert >= 1 rather than == 1.
+        for _ in 0..500 {
             {
                 let w = db.shared.state.lock().unwrap();
                 if w.version.levels.len() >= 3
                     && w.version.levels[0].is_empty()
                     && w.version.levels[1].is_empty()
-                    && w.version.levels[2].len() == 1
+                    && !w.version.levels[2].is_empty()
                 {
                     break;
                 }
@@ -3369,7 +3371,8 @@ mod tests {
         assert!(w.version.levels.len() >= 3);
         assert!(w.version.levels[0].is_empty());
         assert!(w.version.levels[1].is_empty());
-        assert_eq!(w.version.levels[2].len(), 1);
+        assert!(!w.version.levels[2].is_empty());
+        drop(w); // release lock before close() acquires it
         db.close().unwrap();
     }
 
