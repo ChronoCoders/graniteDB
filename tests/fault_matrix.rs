@@ -61,6 +61,10 @@ fn fault_matrix_covers_write_and_sync_boundaries() {
                 "current:dir_sync",
                 "current:before_dir_sync",
                 "current:after_dir_sync",
+                "flush:before_new_wal_create",
+                "flush:after_new_wal_create",
+                "flush:before_sst_finish",
+                "flush:after_sst_finish",
                 "flush:before_sst_rename",
                 "flush:after_sst_rename",
                 "flush:before_dir_sync",
@@ -101,6 +105,8 @@ fn fault_matrix_covers_write_and_sync_boundaries() {
                 "current:dir_sync",
                 "current:before_dir_sync",
                 "current:after_dir_sync",
+                "compaction:before_sst_finish",
+                "compaction:after_sst_finish",
                 "compaction:before_sst_rename",
                 "compaction:after_sst_rename",
                 "compaction:before_dir_sync",
@@ -240,12 +246,16 @@ fn db_matches_model(scenario: &str, db: &DB, model: &BTreeMap<Vec<u8>, Option<Ve
 }
 
 fn actions_for_failpoint(failpoint: &str) -> &'static [&'static str] {
-    static WRITE_ACTIONS: &[&str] = &["abort", "partial:1", "corrupt_abort:1", "ioerr"];
+    static WRITE_ACTIONS: &[&str] = &["abort", "partial:1", "torn_abort:1", "corrupt_abort:1", "ioerr"];
     static SYNC_ACTIONS: &[&str] = &["ioerr", "partial:1", "diskfull:1"];
     static IOERR_ACTIONS: &[&str] = &["abort", "ioerr"];
     static IOERR_ONLY: &[&str] = &["ioerr"];
     static HIT_ACTIONS: &[&str] = &["abort"];
 
+    // flush/compaction before_/after_ points use both hit() and io_err() — check before generic rule
+    if failpoint.starts_with("flush:") || failpoint.starts_with("compaction:") {
+        return IOERR_ACTIONS;
+    }
     if failpoint.contains(":before_") || failpoint.contains(":after_") {
         return HIT_ACTIONS;
     }
@@ -260,9 +270,6 @@ fn actions_for_failpoint(failpoint: &str) -> &'static [&'static str] {
     }
     if failpoint == "manifest:checkpoint_sync" {
         return SYNC_ACTIONS;
-    }
-    if failpoint.starts_with("flush:") || failpoint.starts_with("compaction:") {
-        return IOERR_ACTIONS;
     }
     WRITE_ACTIONS
 }
