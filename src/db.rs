@@ -13,8 +13,9 @@ use crate::internal_key::{
 };
 use crate::manifest::{Manifest, VersionSet};
 use crate::memtable::MemTable;
+use crate::merge::MergeOperator;
 use crate::options::{CompactionStyle, Options, SyncMode};
-use crate::sstable::{BlockCache, TableBuilder, TableReader};
+use crate::sstable::{BlockCache, SstScanner, TableBuilder, TableReader};
 use crate::util::sync_parent_dir;
 use crate::wal::Wal;
 use crate::write_batch::{WriteBatch, WriteOp};
@@ -77,15 +78,215 @@ impl Range {
     }
 }
 
+enum IterSource {
+    Mem(std::vec::IntoIter<(Vec<u8>, Vec<u8>)>),
+    Sst(SstScanner),
+}
+
+impl IterSource {
+    fn next_item(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
+        match self {
+            IterSource::Mem(it) => it.next(),
+            IterSource::Sst(s) => s.next_item().ok().flatten(),
+        }
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct MergeHeapEntry {
+    key: Vec<u8>,
+    value: Vec<u8>,
+    src: usize,
+}
+
+impl Ord for MergeHeapEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match cmp_internal_key_bytes_unchecked(&self.key, &other.key) {
+            std::cmp::Ordering::Equal => self.src.cmp(&other.src),
+            o => o,
+        }
+    }
+}
+
+impl PartialOrd for MergeHeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 pub struct DbIterator {
-    items: std::vec::IntoIter<(Vec<u8>, Vec<u8>)>,
+    sources: Vec<IterSource>,
+    heap: std::collections::BinaryHeap<std::cmp::Reverse<MergeHeapEntry>>,
+    cf_id: u32,
+    range: Range,
+    snapshot_seq: u64,
+    merge_op: Arc<dyn MergeOperator>,
+    active_tombstones: Vec<(Vec<u8>, u64)>,
+    cur_user_key: Option<Vec<u8>>,
+    cur_in_range: bool,
+    cur_base: Option<Option<Vec<u8>>>,
+    cur_operands: Vec<Vec<u8>>,
+    done: bool,
+}
+
+impl DbIterator {
+    fn flush_current_key(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
+        let k = self.cur_user_key.take()?;
+        if !self.cur_in_range {
+            self.cur_base = None;
+            self.cur_operands.clear();
+            return None;
+        }
+        if self.cur_operands.is_empty() {
+            match self.cur_base.take() {
+                Some(Some(v)) => Some((k, v)),
+                _ => None,
+            }
+        } else {
+            let existing = match &self.cur_base {
+                Some(Some(v)) => Some(v.as_slice()),
+                _ => None,
+            };
+            let operand_slices: Vec<&[u8]> =
+                self.cur_operands.iter().rev().map(|v| v.as_slice()).collect();
+            let result = self
+                .merge_op
+                .full_merge(&k, existing, &operand_slices)
+                .ok()
+                .flatten()
+                .map(|v| (k, v));
+            self.cur_base = None;
+            self.cur_operands.clear();
+            result
+        }
+    }
+
+    fn process_entry_for_cur_key(
+        &mut self,
+        value_type: ValueType,
+        value: Vec<u8>,
+        user_key: &[u8],
+        seq: u64,
+    ) {
+        if self.cur_base.is_some() {
+            return;
+        }
+        let range_seq = self
+            .active_tombstones
+            .iter()
+            .filter_map(|(end, s)| (user_key < end.as_slice()).then_some(*s))
+            .max();
+        if range_seq.is_some_and(|r| r >= seq) {
+            self.cur_base = Some(None);
+            return;
+        }
+        match value_type {
+            ValueType::Value => self.cur_base = Some(Some(value)),
+            ValueType::Tombstone => self.cur_base = Some(None),
+            ValueType::MergeOperand => self.cur_operands.push(value),
+            ValueType::RangeTombstone => {}
+        }
+    }
 }
 
 impl Iterator for DbIterator {
     type Item = (Vec<u8>, Vec<u8>);
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.items.next()
+        use std::cmp::Reverse;
+        loop {
+            if self.done {
+                return None;
+            }
+
+            let entry = match self.heap.pop() {
+                Some(Reverse(e)) => e,
+                None => {
+                    self.done = true;
+                    return self.flush_current_key();
+                }
+            };
+
+            let src = entry.src;
+            if let Some((nk, nv)) = self.sources[src].next_item() {
+                self.heap.push(Reverse(MergeHeapEntry {
+                    key: nk,
+                    src,
+                    value: nv,
+                }));
+            }
+
+            let parsed = match parse_internal_key(&entry.key) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            if parsed.seq > self.snapshot_seq {
+                continue;
+            }
+            let (entry_cf_id, user_key) = match split_cf_user_key(parsed.user_key) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if entry_cf_id != self.cf_id {
+                if entry_cf_id > self.cf_id {
+                    self.done = true;
+                    return self.flush_current_key();
+                }
+                continue;
+            }
+
+            self.active_tombstones
+                .retain(|(end, _)| user_key < end.as_slice());
+
+            if parsed.value_type == ValueType::RangeTombstone {
+                let Ok((end_cf_id, end_user_key)) = split_cf_user_key(&entry.value) else {
+                    continue;
+                };
+                if end_cf_id != self.cf_id {
+                    continue;
+                }
+                if end_user_key > user_key {
+                    self.active_tombstones
+                        .push((end_user_key.to_vec(), parsed.seq));
+                }
+                continue;
+            }
+
+            let is_new_key = self
+                .cur_user_key
+                .as_ref()
+                .is_none_or(|k| k.as_slice() != user_key);
+
+            if is_new_key {
+                let prev_result = self.flush_current_key();
+                self.cur_user_key = Some(user_key.to_vec());
+                self.cur_in_range = user_key_in_range(user_key, &self.range);
+                self.cur_base = None;
+                self.cur_operands.clear();
+                if self.cur_in_range {
+                    self.process_entry_for_cur_key(
+                        parsed.value_type,
+                        entry.value,
+                        user_key,
+                        parsed.seq,
+                    );
+                }
+                if let Some(result) = prev_result {
+                    return Some(result);
+                }
+                continue;
+            }
+
+            if !self.cur_in_range {
+                continue;
+            }
+            self.process_entry_for_cur_key(
+                parsed.value_type,
+                entry.value,
+                user_key,
+                parsed.seq,
+            );
+        }
     }
 }
 
@@ -1239,16 +1440,66 @@ impl DB {
         range: Range,
         snapshot: Snapshot,
     ) -> Result<DbIterator> {
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+
         let w = self
             .shared
             .state
             .lock()
             .map_err(|_| GraniteError::Corrupt("poisoned"))?;
 
-        let out = collect_visible_items(&self.path, &w, cf_id, &range, snapshot)?;
+        let seek_prefix =
+            encode_internal_key(&cf_id.to_be_bytes(), u64::MAX, ValueType::Tombstone);
+
+        let mut sources: Vec<IterSource> = Vec::new();
+
+        let mem_items: Vec<(Vec<u8>, Vec<u8>)> = w.memtable.iter_internal().collect();
+        sources.push(IterSource::Mem(mem_items.into_iter()));
+
+        if let Some(imm) = w.imm_memtable.as_ref() {
+            let imm_items: Vec<(Vec<u8>, Vec<u8>)> = imm.iter_internal().collect();
+            sources.push(IterSource::Mem(imm_items.into_iter()));
+        }
+
+        for level in &w.version.levels {
+            for meta in level {
+                let path = self.path.join(sst_file_name(meta.file_id));
+                let reader =
+                    TableReader::open_with_cache(path, Some(w.block_cache.clone()))?;
+                let mut scanner = reader.scanner();
+                scanner.seek(&seek_prefix)?;
+                sources.push(IterSource::Sst(scanner));
+            }
+        }
+
+        let merge_op = w.options.merge_operator.clone();
+        drop(w);
+
+        let mut heap: BinaryHeap<Reverse<MergeHeapEntry>> = BinaryHeap::new();
+        for (i, src) in sources.iter_mut().enumerate() {
+            if let Some((k, v)) = src.next_item() {
+                heap.push(Reverse(MergeHeapEntry {
+                    key: k,
+                    src: i,
+                    value: v,
+                }));
+            }
+        }
 
         Ok(DbIterator {
-            items: out.into_iter(),
+            sources,
+            heap,
+            cf_id,
+            range,
+            snapshot_seq: snapshot.read_seq,
+            merge_op,
+            active_tombstones: Vec::new(),
+            cur_user_key: None,
+            cur_in_range: false,
+            cur_base: None,
+            cur_operands: Vec::new(),
+            done: false,
         })
     }
 
@@ -2532,237 +2783,6 @@ fn collect_overlaps_expanding(
     Ok((out, min_user, max_user))
 }
 
-fn collect_visible_items(
-    db_dir: &Path,
-    w: &WriterState,
-    cf_id: u32,
-    range: &Range,
-    snapshot: Snapshot,
-) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    use std::cmp::Reverse;
-    use std::collections::BinaryHeap;
-
-    struct Source {
-        items: Vec<(Vec<u8>, Vec<u8>)>,
-        idx: usize,
-    }
-
-    impl Source {
-        fn next(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
-            if self.idx >= self.items.len() {
-                return None;
-            }
-            let out = self.items[self.idx].clone();
-            self.idx += 1;
-            Some(out)
-        }
-    }
-
-    let mut sources: Vec<Source> = Vec::new();
-
-    let mem_items: Vec<(Vec<u8>, Vec<u8>)> = w.memtable.iter_internal().collect();
-    sources.push(Source {
-        items: mem_items,
-        idx: 0,
-    });
-
-    if let Some(imm) = w.imm_memtable.as_ref() {
-        let imm_items: Vec<(Vec<u8>, Vec<u8>)> = imm.iter_internal().collect();
-        sources.push(Source {
-            items: imm_items,
-            idx: 0,
-        });
-    }
-
-    let seek_prefix = encode_internal_key(&cf_id.to_be_bytes(), u64::MAX, ValueType::Tombstone);
-    for level in &w.version.levels {
-        for meta in level {
-            let path = db_dir.join(sst_file_name(meta.file_id));
-            let reader = TableReader::open_with_cache(path, Some(w.block_cache.clone()))?;
-            let mut it = reader.scanner();
-            it.seek(&seek_prefix)?;
-            let mut items = Vec::new();
-            while let Some((k, v)) = it.next_item()? {
-                if internal_key_past_end_for_cf(&k, cf_id, range)? {
-                    break;
-                }
-                items.push((k, v));
-            }
-            sources.push(Source { items, idx: 0 });
-        }
-    }
-
-    #[derive(Clone, Eq, PartialEq)]
-    struct HeapEntry {
-        key: Vec<u8>,
-        src: usize,
-        value: Vec<u8>,
-    }
-
-    impl Ord for HeapEntry {
-        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-            match cmp_internal_key_bytes_unchecked(&self.key, &other.key) {
-                std::cmp::Ordering::Equal => self.src.cmp(&other.src),
-                other => other,
-            }
-        }
-    }
-
-    impl PartialOrd for HeapEntry {
-        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-            Some(self.cmp(other))
-        }
-    }
-
-    type HeapItem = Reverse<HeapEntry>;
-    let mut heap: BinaryHeap<HeapItem> = BinaryHeap::new();
-    for (i, s) in sources.iter_mut().enumerate() {
-        if let Some((k, v)) = s.next() {
-            heap.push(Reverse(HeapEntry {
-                key: k,
-                src: i,
-                value: v,
-            }));
-        }
-    }
-
-    let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    let mut active_range_tombstones: Vec<(Vec<u8>, u64)> = Vec::new();
-    let mut current_user_key: Option<Vec<u8>> = None;
-    let mut current_in_range = false;
-    let mut current_base: Option<Option<Vec<u8>>> = None;
-    let mut current_operands: Vec<Vec<u8>> = Vec::new();
-
-    while let Some(Reverse(e)) = heap.pop() {
-        let src = e.src;
-        if let Some((nk, nv)) = sources[src].next() {
-            heap.push(Reverse(HeapEntry {
-                key: nk,
-                src,
-                value: nv,
-            }));
-        }
-
-        let parsed = parse_internal_key(&e.key)?;
-        if parsed.seq > snapshot.read_seq {
-            continue;
-        }
-        let Ok((entry_cf_id, user_key)) = split_cf_user_key(parsed.user_key) else {
-            continue;
-        };
-        if entry_cf_id != cf_id {
-            if entry_cf_id > cf_id {
-                break;
-            }
-            continue;
-        }
-        active_range_tombstones.retain(|(end, _)| user_key < end.as_slice());
-
-        if parsed.value_type == ValueType::RangeTombstone {
-            let Ok((end_cf_id, end_user_key)) = split_cf_user_key(&e.value) else {
-                continue;
-            };
-            if end_cf_id != cf_id {
-                continue;
-            }
-            if end_user_key > user_key {
-                active_range_tombstones.push((end_user_key.to_vec(), parsed.seq));
-            }
-            continue;
-        }
-
-        let is_new_key = current_user_key
-            .as_ref()
-            .is_none_or(|k| k.as_slice() != user_key);
-        if is_new_key {
-            if let Some(k) = current_user_key.take()
-                && current_in_range
-            {
-                if current_operands.is_empty() {
-                    if let Some(Some(v)) = current_base.take() {
-                        out.push((k, v));
-                    }
-                } else {
-                    let existing = match &current_base {
-                        Some(Some(v)) => Some(v.as_slice()),
-                        _ => None,
-                    };
-                    let operand_slices: Vec<&[u8]> = current_operands
-                        .iter()
-                        .rev()
-                        .map(|v| v.as_slice())
-                        .collect();
-                    if let Some(v) =
-                        w.options
-                            .merge_operator
-                            .full_merge(&k, existing, &operand_slices)?
-                    {
-                        out.push((k, v));
-                    }
-                }
-            }
-            current_user_key = Some(user_key.to_vec());
-            current_in_range = user_key_in_range(user_key, range);
-            current_base = None;
-            current_operands.clear();
-        }
-
-        if !current_in_range {
-            continue;
-        }
-
-        let range_seq = active_range_tombstones
-            .iter()
-            .filter_map(|(end, seq)| (user_key < end.as_slice()).then_some(*seq))
-            .max();
-
-        if current_base.is_some() {
-            continue;
-        }
-
-        if range_seq.is_some_and(|r| r >= parsed.seq) {
-            current_base = Some(None);
-            continue;
-        }
-
-        match parsed.value_type {
-            ValueType::Value => current_base = Some(Some(e.value)),
-            ValueType::Tombstone => current_base = Some(None),
-            ValueType::MergeOperand => current_operands.push(e.value),
-            ValueType::RangeTombstone => {}
-        }
-    }
-
-    if let Some(k) = current_user_key.take()
-        && current_in_range
-    {
-        if current_operands.is_empty() {
-            if let Some(Some(v)) = current_base.take() {
-                out.push((k, v));
-            }
-        } else {
-            let existing = match &current_base {
-                Some(Some(v)) => Some(v.as_slice()),
-                _ => None,
-            };
-            let operand_slices: Vec<&[u8]> = current_operands
-                .iter()
-                .rev()
-                .map(|v| v.as_slice())
-                .collect();
-            if let Some(v) = w
-                .options
-                .merge_operator
-                .full_merge(&k, existing, &operand_slices)?
-            {
-                out.push((k, v));
-            }
-        }
-    }
-
-    Ok(out)
-}
-
 fn user_key_in_range(user_key: &[u8], range: &Range) -> bool {
     match &range.start {
         Bound::Included(k) if user_key < k.as_slice() => return false,
@@ -2786,22 +2806,6 @@ fn successor_key(mut key: Vec<u8>) -> Option<Vec<u8>> {
         }
     }
     None
-}
-
-fn internal_key_past_end_for_cf(internal_key: &[u8], cf_id: u32, range: &Range) -> Result<bool> {
-    let parsed = parse_internal_key(internal_key)?;
-    let (entry_cf_id, user_key) = split_cf_user_key(parsed.user_key)?;
-    if entry_cf_id > cf_id {
-        return Ok(true);
-    }
-    if entry_cf_id < cf_id {
-        return Ok(false);
-    }
-    match &range.end {
-        Bound::Unbounded => Ok(false),
-        Bound::Included(k) => Ok(user_key > k.as_slice()),
-        Bound::Excluded(k) => Ok(user_key >= k.as_slice()),
-    }
 }
 
 fn encode_cf_user_key(cf_id: u32, user_key: &[u8]) -> Vec<u8> {
